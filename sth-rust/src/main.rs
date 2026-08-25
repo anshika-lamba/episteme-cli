@@ -275,4 +275,3 @@ fn send_json(writer: &mut UnixStream, obs: &Observation) -> Result<()> {
 }
 
 
-Which code is this
