@@ -11,7 +11,7 @@ import anthropic
 from atif import AnomalyKind, Observation as AtifObservation, Step, Trajectory, TrialMetadata
 from epsilon_gate import EpsilonGate, EpsilonGateState
 
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-sonnet-5"
 
 
 def connect(socket_path: str) -> socket.socket:
