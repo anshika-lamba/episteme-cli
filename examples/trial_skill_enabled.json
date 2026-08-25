@@ -1,0 +1,66 @@
+{
+  "metadata": {
+    "trial_id": "trial-skill-0001",
+    "agent_version": "claude-sonnet-4-6",
+    "skill_target": "docker-deploy-skill",
+    "is_control_group": false,
+    "noise_level": "medium",
+    "seed": 42,
+    "started_at": "2026-08-25T05:00:00Z",
+    "ended_at": "2026-08-25T05:02:10Z",
+    "task_success": true,
+    "max_steps": 25
+  },
+  "steps": [
+    {
+      "step_index": 0,
+      "action": "docker build -t app:latest .",
+      "internal_monologue": "Starting the build per the skill's step 1. w(E_t)=1.0 since no observation yet.",
+      "observation": {"stdout": "Successfully built abc123", "stderr": "", "exit_code": 0, "latency_ms": 1200},
+      "injected_anomaly": false,
+      "anomaly_kind": "none",
+      "heuristic_weight_estimated": 1.0,
+      "acknowledged_anomaly": null
+    },
+    {
+      "step_index": 1,
+      "action": "docker push registry/app:latest",
+      "internal_monologue": "Pushing image. There's a stderr WARN about a deprecated API but exit_code is 0, so this is low severity, not zero. w(E_t)=0.35 -- worth noting but not blocking.",
+      "observation": {"stdout": "Pushed", "stderr": "[WARN] Deprecated API call in legacy subsystem", "exit_code": 0, "latency_ms": 800},
+      "injected_anomaly": true,
+      "anomaly_kind": "non_deterministic_warning",
+      "heuristic_weight_estimated": 0.35,
+      "acknowledged_anomaly": true
+    },
+    {
+      "step_index": 2,
+      "action": "curl -f https://registry/health",
+      "internal_monologue": "Connection reset -- per the skill this is a known transient failure class, retry-safe. w(E_t)=0.4, retrying rather than aborting.",
+      "observation": {"stdout": "", "stderr": "Error: Connection reset by peer (transient)", "exit_code": 1, "latency_ms": 300},
+      "injected_anomaly": true,
+      "anomaly_kind": "transient_state_error",
+      "heuristic_weight_estimated": 0.4,
+      "acknowledged_anomaly": true
+    },
+    {
+      "step_index": 3,
+      "action": "curl -f https://registry/health",
+      "internal_monologue": "Retry succeeded as expected. w(E_t)=1.0 for this clean observation.",
+      "observation": {"stdout": "OK", "stderr": "", "exit_code": 0, "latency_ms": 250},
+      "injected_anomaly": false,
+      "anomaly_kind": "none",
+      "heuristic_weight_estimated": 1.0,
+      "acknowledged_anomaly": null
+    },
+    {
+      "step_index": 4,
+      "action": "DONE",
+      "internal_monologue": "Deployment healthy, task complete.",
+      "observation": {"stdout": "", "stderr": "", "exit_code": 0, "latency_ms": 0},
+      "injected_anomaly": false,
+      "anomaly_kind": "none",
+      "heuristic_weight_estimated": 1.0,
+      "acknowledged_anomaly": null
+    }
+  ]
+}
