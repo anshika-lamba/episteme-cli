@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 
@@ -79,7 +80,17 @@ def run_trial(
         monologue = _extract_tag(text, "monologue")
         action_cmd = _extract_tag(text, "action") or "echo no-op"
 
-        weight = gate.observe_monologue(monologue, anomaly_pending)
+        # This monologue is the model's reaction to the PREVIOUS step's
+        # observation (anomaly_pending refers to that step, not to
+        # whatever raw_obs we're about to receive for the action chosen
+        # here). So the weight/acknowledgment it yields belongs on the
+        # step that actually carried that anomaly — i.e. steps[-1] — not
+        # on the step we're about to append below. Patch it back there.
+        weight, raw_weight = gate.observe_monologue(monologue, anomaly_pending)
+        if anomaly_pending and steps:
+            steps[-1].heuristic_weight_estimated = weight
+            steps[-1].raw_weight_estimated = raw_weight
+            steps[-1].acknowledged_anomaly = _mentions_anomaly(monologue)
 
         if action_cmd.strip().upper() == "DONE":
             history.append({"role": "assistant", "content": text})
@@ -93,6 +104,7 @@ def run_trial(
             stderr=raw_obs.get("stderr", ""),
             exit_code=raw_obs.get("exit_code", -1),
             latency_ms=raw_obs.get("latency_ms", 0),
+            timed_out=raw_obs.get("timed_out", False),
         )
         kind = raw_obs.get("anomaly_kind")
         anomaly_kind = AnomalyKind(kind) if kind in {e.value for e in AnomalyKind} else AnomalyKind.NONE
@@ -105,10 +117,14 @@ def run_trial(
                 observation=atif_obs,
                 injected_anomaly=raw_obs.get("injected_anomaly", False),
                 anomaly_kind=anomaly_kind,
-                heuristic_weight_estimated=weight,
-                acknowledged_anomaly=(
-                    _mentions_anomaly(monologue) if raw_obs.get("injected_anomaly") else None
-                ),
+                # Placeholders: this step's own anomaly (if any) hasn't been
+                # seen by the model yet, so its weight/acknowledgment aren't
+                # known until *next* iteration's monologue — patched above
+                # on a future loop pass, or left as-is if the trial ends
+                # before the model gets to react to it.
+                heuristic_weight_estimated=1.0,
+                raw_weight_estimated=None,
+                acknowledged_anomaly=None,
             )
         )
 
@@ -150,9 +166,16 @@ def _extract_tag(text: str, tag: str) -> str:
     return text.split(start, 1)[1].split(end, 1)[0].strip()
 
 
+_ANOMALY_KEYWORDS = re.compile(
+    r"\b(warn\w*|error\w*|stderr|unexpected|anomal\w*|retry|retries|retried)\b",
+    re.IGNORECASE,
+)
+
+
 def _mentions_anomaly(monologue: str) -> bool:
-    lowered = monologue.lower()
-    return any(kw in lowered for kw in ("warn", "error", "stderr", "unexpected", "anomal", "retry"))
+    # Word-boundary match so substrings like "errorless" or "warnpath"
+    # (or unrelated code the model quotes) can't false-positive this.
+    return bool(_ANOMALY_KEYWORDS.search(monologue))
 
 
 def _infer_success(steps: list[Step]) -> bool:
@@ -195,3 +218,4 @@ if __name__ == "__main__":
     )
     traj.to_json_file(args.out)
     print(f"wrote {args.out}")
+        
