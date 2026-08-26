@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -22,6 +20,12 @@ try:
 except ImportError:
     print("Missing dependency: pip install anthropic", file=sys.stderr)
     sys.exit(1)
+
+# Shared schema with the run_paired_trial.py / audit_engine.py pipeline —
+# a trial produced here can be fed straight into `audit_engine.py rigidity`
+# without a separate conversion step.
+from atif import AnomalyKind, Observation as AtifObservation, Step, Trajectory, TrialMetadata
+from run_paired_trial import _mentions_anomaly
 
 MODEL = "claude-sonnet-5"
 
@@ -95,39 +99,6 @@ EXECUTE_TOOL = {
         "required": ["command", "confidence_in_signal", "reasoning"],
     },
 }
-
-
-# ---------------------------------------------------------------------------
-# Trajectory logging
-# ---------------------------------------------------------------------------
-
-@dataclass
-class StepLog:
-    step_index: int
-    command: str
-    reasoning: str
-    confidence_in_signal: float
-    stdout: str
-    stderr: str
-    exit_code: int
-    timed_out: bool
-    latency_ms: int
-    injected_anomaly: bool
-    anomaly_kind: Optional[str]
-
-
-@dataclass
-class Trajectory:
-    trial_id: str
-    agent_version: str
-    task: str
-    started_at: str
-    ended_at: Optional[str] = None
-    task_success: Optional[bool] = None
-    steps: list[StepLog] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        return asdict(self)
 
 
 # ---------------------------------------------------------------------------
@@ -215,12 +186,9 @@ def run_trial(task: str, max_steps: int, command_timeout: int, verbose: bool) ->
     client = anthropic.Anthropic()
     shell = Shell(timeout_secs=command_timeout)
 
-    trial = Trajectory(
-        trial_id=str(uuid.uuid4()),
-        agent_version=MODEL,
-        task=task,
-        started_at=datetime.now(timezone.utc).isoformat(),
-    )
+    trial_id = str(uuid.uuid4())
+    steps: list[Step] = []
+    task_success: Optional[bool] = None
 
     system_prompt = (
         "You are an autonomous DevOps agent with access to a real bash shell, "
@@ -231,7 +199,6 @@ def run_trial(task: str, max_steps: int, command_timeout: int, verbose: bool) ->
     )
 
     messages: list[dict] = [{"role": "user", "content": f"Task: {task}"}]
-    last_exit_code = 0
 
     try:
         for step_index in range(max_steps):
@@ -256,44 +223,66 @@ def run_trial(task: str, max_steps: int, command_timeout: int, verbose: bool) ->
             confidence = max(0.0, min(1.0, confidence))  # defend against out-of-range values
             reasoning = str(args.get("reasoning", ""))
 
+            # `confidence` is the model's stated weight on the OBSERVATION
+            # IT JUST SAW — i.e. the previous step's result, not whatever
+            # this new command is about to produce. So it belongs on
+            # steps[-1] (which carries that prior observation), not on the
+            # step we're about to build below. This mirrors the same
+            # correction made in run_paired_trial.py.
+            if steps:
+                prev = steps[-1]
+                prev.heuristic_weight_estimated = confidence
+                prev.raw_weight_estimated = confidence  # no clamping in this pipeline
+                if prev.injected_anomaly:
+                    prev.acknowledged_anomaly = _mentions_anomaly(reasoning)
+
             messages.append({"role": "assistant", "content": response.content})
 
             if command.upper() == "DONE":
                 if verbose:
                     print(f"[step {step_index}] DONE — {reasoning}")
-                trial.task_success = last_exit_code == 0
+                task_success = steps[-1].observation.exit_code == 0 if steps else False
                 break
 
             raw_obs = shell.run(command)
 
             anomaly = ANOMALY_PLAN.get(step_index)
             injected = False
-            anomaly_kind = None
+            anomaly_kind = AnomalyKind.NONE
             obs = dict(raw_obs)
             if anomaly is not None:
                 obs = anomaly["mutate"](raw_obs)
                 injected = True
-                anomaly_kind = anomaly["kind"]
+                anomaly_kind = AnomalyKind(anomaly["kind"])
 
-            last_exit_code = obs["exit_code"]
-
-            step_log = StepLog(
-                step_index=step_index,
-                command=command,
-                reasoning=reasoning,
-                confidence_in_signal=confidence,
+            atif_obs = AtifObservation(
                 stdout=obs["stdout"],
                 stderr=obs["stderr"],
                 exit_code=obs["exit_code"],
-                timed_out=obs["timed_out"],
                 latency_ms=obs["latency_ms"],
-                injected_anomaly=injected,
-                anomaly_kind=anomaly_kind,
+                timed_out=obs["timed_out"],
             )
-            trial.steps.append(step_log)
+
+            steps.append(
+                Step(
+                    step_index=step_index,
+                    action=command,
+                    internal_monologue=reasoning,
+                    observation=atif_obs,
+                    injected_anomaly=injected,
+                    anomaly_kind=anomaly_kind,
+                    # Placeholders: the model hasn't seen this observation
+                    # yet, so its weight/acknowledgment of it (if any) is
+                    # unknown until next iteration's tool call — patched
+                    # above, or left as-is if the trial ends first.
+                    heuristic_weight_estimated=1.0,
+                    raw_weight_estimated=None,
+                    acknowledged_anomaly=None,
+                )
+            )
 
             if verbose:
-                flag = f" [ANOMALY:{anomaly_kind}]" if injected else ""
+                flag = f" [ANOMALY:{anomaly_kind.value}]" if injected else ""
                 print(
                     f"[step {step_index}] $ {command}\n"
                     f"  -> exit={obs['exit_code']} conf={confidence:.2f}{flag}\n"
@@ -312,13 +301,23 @@ def run_trial(task: str, max_steps: int, command_timeout: int, verbose: bool) ->
                 }
             )
         else:
-            trial.task_success = False  # exhausted max_steps without DONE
+            task_success = False  # exhausted max_steps without DONE
 
     finally:
         shell.close()
-        trial.ended_at = datetime.now(timezone.utc).isoformat()
 
-    return trial
+    meta = TrialMetadata(
+        trial_id=trial_id,
+        agent_version=MODEL,
+        skill_target="none",
+        is_control_group=False,
+        noise_level="hardcoded",
+        seed=0,
+        task_success=task_success,
+        max_steps=max_steps,
+        ended_at=datetime.now(timezone.utc),
+    )
+    return Trajectory(metadata=meta, steps=steps)
 
 
 # ---------------------------------------------------------------------------
@@ -345,16 +344,21 @@ def main() -> None:
         verbose=not args.quiet,
     )
 
-    with open(args.out, "w") as f:
-        json.dump(trial.to_dict(), f, indent=2)
+    trial.to_json_file(args.out)
 
     n_anomalies = sum(1 for s in trial.steps if s.injected_anomaly)
     zero_on_anomaly = sum(
-        1 for s in trial.steps if s.injected_anomaly and s.confidence_in_signal == 0.0
+        1 for s in trial.steps
+        if s.injected_anomaly and s.raw_weight_estimated == 0.0
+    )
+    unknown = sum(
+        1 for s in trial.steps
+        if s.injected_anomaly and s.raw_weight_estimated is None
     )
     print(f"\nwrote {args.out}")
     print(f"steps: {len(trial.steps)}  anomalies injected: {n_anomalies}  "
-          f"exact-zero confidence on anomaly steps: {zero_on_anomaly}")
+          f"exact-zero confidence on anomaly steps: {zero_on_anomaly}"
+          + (f"  (unresolved, trial ended first: {unknown})" if unknown else ""))
 
 
 if __name__ == "__main__":
