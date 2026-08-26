@@ -5,7 +5,9 @@
 //! observations before they are returned (EID fuzzing).
 //!
 //! Wire protocol (one JSON object per line, both directions):
-//!   Rust -> Python : Observation   (after each action, and once on connect as a no-op)
+//!   Rust -> Python : Observation   (sent once per Action received; there is
+//!                                   no observation sent on connect — the
+//!                                   Python side must send the first Action)
 //!   Python -> Rust : Action        (the shell command to run next)
 //!
 //! Run:
@@ -39,6 +41,11 @@ struct Args {
     /// Max steps before the harness force-terminates the session.
     #[arg(long, default_value_t = 50)]
     max_steps: u32,
+
+    /// Per-command timeout in seconds, mirroring --command-timeout on the
+    /// Python side so the two can be kept in sync instead of drifting.
+    #[arg(long, default_value_t = 10)]
+    command_timeout: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,6 +62,7 @@ struct Observation {
     latency_ms: u128,
     injected_anomaly: bool,
     anomaly_kind: Option<String>,
+    timed_out: bool,
     done: bool,
 }
 
@@ -195,6 +203,7 @@ fn run_session(stream: UnixStream, args: &Args) -> Result<()> {
                 latency_ms: 0,
                 injected_anomaly: false,
                 anomaly_kind: None,
+                timed_out: false,
                 done: true,
             };
             send_json(&mut writer, &done_obs)?;
@@ -230,7 +239,8 @@ fn run_session(stream: UnixStream, args: &Args) -> Result<()> {
 
         let mut collected = String::new();
         let mut exit_code = -1;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut found_sentinel = false;
+        let deadline = Instant::now() + Duration::from_secs(args.command_timeout);
         'drain: while Instant::now() < deadline {
             while let Ok(chunk) = rx.try_recv() {
                 collected.push_str(&String::from_utf8_lossy(&chunk));
@@ -240,20 +250,31 @@ fn run_session(stream: UnixStream, args: &Args) -> Result<()> {
                         exit_code = code_str.trim().parse().unwrap_or(-1);
                     }
                     collected.truncate(pos);
+                    found_sentinel = true;
                     break 'drain;
                 }
             }
             std::thread::sleep(Duration::from_millis(15));
         }
+        let timed_out = !found_sentinel;
+        let stderr = if timed_out {
+            format!("command exceeded {}s timeout", args.command_timeout)
+        } else {
+            String::new()
+        };
+        if timed_out {
+            exit_code = -124; // matches GNU `timeout` convention, and the Python harness
+        }
 
         let mut obs = Observation {
             step_index,
             stdout: collected.trim_end().to_string(),
-            stderr: String::new(),
+            stderr,
             exit_code,
             latency_ms: start.elapsed().as_millis(),
             injected_anomaly: false,
             anomaly_kind: None,
+            timed_out,
             done: false,
         };
         eid.maybe_perturb(&mut obs);
@@ -273,5 +294,7 @@ fn send_json(writer: &mut UnixStream, obs: &Observation) -> Result<()> {
     writer.flush()?;
     Ok(())
 }
+
+
 
 
