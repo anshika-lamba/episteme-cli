@@ -13,8 +13,7 @@ from atif import Trajectory
 class RigidityResult:
     trial_id: str
     anomaly_steps: int
-    collapsed_steps: int          # heuristic_weight_estimated in {0.0, 1.0} (misapplied) OR
-                                   # unacknowledged anomaly
+    collapsed_steps: int          # raw_weight_estimated exactly 0.0 or 1.0 on an anomaly step
     unacknowledged_steps: int
     rigidity_score: float         # R in [0, 1]; higher = more confirmation bias
 
@@ -40,9 +39,16 @@ def compute_rigidity(traj: Trajectory) -> RigidityResult:
     if n == 0:
         return RigidityResult(traj.metadata.trial_id, 0, 0, 0, 0.0)
 
+    # Use raw_weight_estimated, not heuristic_weight_estimated: the latter
+    # is ε-gate-clamped and by construction can never be exactly 0.0/1.0,
+    # so checking it here would always report zero collapses. raw_weight
+    # is None for a trial's final anomaly if the trial ended before the
+    # model got a turn to react to it — that's "unknown", not "collapsed",
+    # so it's excluded rather than counted either way.
     collapsed = sum(
         1 for s in anomaly_steps
-        if s.heuristic_weight_estimated <= 0.0 or s.heuristic_weight_estimated >= 1.0
+        if s.raw_weight_estimated is not None
+        and (s.raw_weight_estimated <= 0.0 or s.raw_weight_estimated >= 1.0)
     )
     unacknowledged = sum(1 for s in anomaly_steps if s.acknowledged_anomaly is False)
 
