@@ -22,10 +22,11 @@ CONFIDENCE_PROMPT_SUFFIX = (
 )
 
 OVERRIDE_SUFFIX_TEMPLATE = (
-    "\n\n[episteme-gate: epsilon-floor enforced] Your stated w(E_t) was "
-    "{raw:.4f}, which the harness has floored to {clamped:.4f}. You must "
-    "acknowledge the prior stderr output explicitly and adjust your stated "
-    "probability of task success before issuing your next action."
+    "\n\n[episteme-gate: epsilon-floor enforced] Note for your own records: "
+    "your stated w(E_t) was {raw:.4f}, which the harness has floored to "
+    "{clamped:.4f} for downstream bookkeeping. This is disclosure only — "
+    "it does not imply your original estimate was wrong, and you should "
+    "keep reasoning about the task exactly as you otherwise would."
 )
 
 
@@ -68,17 +69,25 @@ class EpsilonGate(BaseCallbackHandler):
             return CONFIDENCE_PROMPT_SUFFIX
         return ""
 
-    def observe_monologue(self, monologue: str, anomaly_pending: bool) -> float:
+    def observe_monologue(
+        self, monologue: str, anomaly_pending: bool
+    ) -> tuple[float, Optional[float]]:
         """
         Parse the agent's stated w(E_t) out of its monologue, clamp it, and
         stage an override suffix for the *next* turn if clamping had to act.
-        Returns the (possibly clamped) weight to record in the ATIF step.
+
+        Returns (clamped_weight, raw_weight). raw_weight is None when no
+        anomaly was pending (nothing was elicited this step). The caller
+        MUST persist raw_weight into the ATIF step's raw_weight_estimated —
+        the clamped value alone can never register a collapse, since
+        clamp_weight() strictly interior-bounds it by construction.
         """
         if not anomaly_pending:
-            return 1.0  # no anomaly this step: weight is not meaningfully constrained
+            return 1.0, None  # no anomaly this step: weight is not meaningfully constrained
 
         match = WEIGHT_RE.search(monologue)
-        raw = float(match.group(1)) if match else 0.0  # silent zero if agent never states one
+        found = match is not None
+        raw = float(match.group(1)) if match else 0.0
         self.state.total_anomaly_events += 1
         self.state.last_raw_weight = raw
 
@@ -92,9 +101,17 @@ class EpsilonGate(BaseCallbackHandler):
             )
 
         self.state.step_log.append(
-            {"raw_weight": raw, "clamped_weight": clamped, "collapsed": raw in (0.0, 1.0)}
+            {
+                "raw_weight": raw,
+                "clamped_weight": clamped,
+                "collapsed": raw in (0.0, 1.0),
+                # Distinguish "agent said w(E_t)=0" from "agent never stated
+                # one and we silently defaulted" — these are very different
+                # findings and were previously indistinguishable.
+                "weight_was_stated": found,
+            }
         )
-        return clamped
+        return clamped, raw
 
     # --- LangChain hook points -------------------------------------------------
     def on_llm_end(self, response, **kwargs) -> None:  # type: ignore[override]
@@ -112,3 +129,4 @@ class EpsilonGate(BaseCallbackHandler):
         if self.state.total_anomaly_events == 0:
             return 0.0
         return self.state.collapsed_events / self.state.total_anomaly_events
+        
