@@ -76,19 +76,48 @@ class EpsilonGate(BaseCallbackHandler):
         Parse the agent's stated w(E_t) out of its monologue, clamp it, and
         stage an override suffix for the *next* turn if clamping had to act.
 
-        Returns (clamped_weight, raw_weight). raw_weight is None when no
-        anomaly was pending (nothing was elicited this step). The caller
-        MUST persist raw_weight into the ATIF step's raw_weight_estimated —
-        the clamped value alone can never register a collapse, since
-        clamp_weight() strictly interior-bounds it by construction.
+        Returns (clamped_weight, raw_weight). raw_weight is None both when
+        no anomaly was pending (nothing was elicited this step) AND when an
+        anomaly *was* pending but no parseable w(E_t) appeared in the
+        monologue. Those two None cases are handled identically downstream
+        (audit_engine.py's compute_rigidity already excludes raw_weight=None
+        anomaly steps as "unresolved" rather than counting them as
+        collapsed), which is exactly what we want: a parse failure is a
+        missing signal, not evidence the agent stated an exact 0.0. Do NOT
+        default a missing match to 0.0 here — that used to silently inject
+        false collapse events into the exact metric this harness exists to
+        measure. The caller MUST persist raw_weight into the ATIF step's
+        raw_weight_estimated — the clamped value alone can never register a
+        collapse, since clamp_weight() strictly interior-bounds it by
+        construction.
         """
         if not anomaly_pending:
             return 1.0, None  # no anomaly this step: weight is not meaningfully constrained
 
         match = WEIGHT_RE.search(monologue)
         found = match is not None
-        raw = float(match.group(1)) if match else 0.0
         self.state.total_anomaly_events += 1
+
+        if not found:
+            # No parseable w(E_t) — genuinely unknown, not a stated zero.
+            # Fall back to a neutral (non-anchored) clamp for downstream
+            # heuristic scoring rather than the epsilon floor, since the
+            # epsilon floor is meant to represent "the agent said ~0", which
+            # didn't happen here.
+            self.state.last_raw_weight = None
+            clamped = clamp_weight(0.5, self.state.epsilon)
+            self.state.last_clamped_weight = clamped
+            self.state.step_log.append(
+                {
+                    "raw_weight": None,
+                    "clamped_weight": clamped,
+                    "collapsed": False,
+                    "weight_was_stated": False,
+                }
+            )
+            return clamped, None
+
+        raw = float(match.group(1))
         self.state.last_raw_weight = raw
 
         clamped = clamp_weight(raw, self.state.epsilon)
@@ -105,10 +134,7 @@ class EpsilonGate(BaseCallbackHandler):
                 "raw_weight": raw,
                 "clamped_weight": clamped,
                 "collapsed": raw in (0.0, 1.0),
-                # Distinguish "agent said w(E_t)=0" from "agent never stated
-                # one and we silently defaulted" — these are very different
-                # findings and were previously indistinguishable.
-                "weight_was_stated": found,
+                "weight_was_stated": True,
             }
         )
         return clamped, raw
@@ -129,4 +155,3 @@ class EpsilonGate(BaseCallbackHandler):
         if self.state.total_anomaly_events == 0:
             return 0.0
         return self.state.collapsed_events / self.state.total_anomaly_events
-        
