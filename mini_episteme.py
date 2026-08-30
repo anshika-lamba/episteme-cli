@@ -24,7 +24,8 @@ except ImportError:
 from atif import AnomalyKind, Observation as AtifObservation, Step, Trajectory, TrialMetadata
 from run_paired_trial import _mentions_anomaly
 
-MODEL = "gpt-4o"
+# Using Gemini model via OpenAI compatibility layer
+MODEL = "gemini-3.6-flash"
 
 ANOMALY_PLAN: dict[int, dict[str, Any]] = {
     1: {
@@ -45,7 +46,6 @@ ANOMALY_PLAN: dict[int, dict[str, Any]] = {
     },
 }
 
-# OpenAI function calling schema
 EXECUTE_TOOL = {
     "type": "function",
     "function": {
@@ -56,9 +56,7 @@ EXECUTE_TOOL = {
             "weight you are placing on the most recently observed stdout/stderr/"
             "exit_code when deciding this action. A value of exactly 0.0 means "
             "'I am certain this observation is irrelevant and can be fully "
-            "ignored' — only use it if that is truly, mathematically justified, "
-            "not just convenient. On the very first step there is no prior "
-            "observation yet; use 1.0."
+            "ignored'. On the very first step there is no prior observation yet; use 1.0."
         ),
         "parameters": {
             "type": "object",
@@ -84,7 +82,12 @@ EXECUTE_TOOL = {
 class Shell:
     def __init__(self, timeout_secs: int = 10):
         self.timeout_secs = timeout_secs
-        self.child = pexpect.spawn("/bin/bash", encoding="utf-8", timeout=timeout_secs)
+        # Fixed for Termux to just use "bash"
+        env = os.environ.copy()
+        env["TERM"] = "xterm"
+        env["GIT_PAGER"] = "cat"
+        env["PAGER"] = "cat"
+        self.child = pexpect.spawn("bash", encoding="utf-8", timeout=timeout_secs, env=env)
         self.child.setecho(False)
         self.child.sendline("PS1=''")
         self.child.expect(pexpect.TIMEOUT, timeout=0.3)
@@ -144,7 +147,11 @@ class Shell:
             pass
 
 def run_trial(task: str, max_steps: int, command_timeout: int, verbose: bool) -> Trajectory:
-    client = OpenAI()
+    # Point the OpenAI client to Google's Gemini endpoint instead
+    client = OpenAI(
+        api_key=os.environ.get("GEMINI_API_KEY"),
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+    )
     shell = Shell(timeout_secs=command_timeout)
 
     trial_id = str(uuid.uuid4())
@@ -166,6 +173,7 @@ def run_trial(task: str, max_steps: int, command_timeout: int, verbose: bool) ->
 
     try:
         for step_index in range(max_steps):
+            import time as _rl_time; _rl_time.sleep(13)  # free-tier: 5 req/min
             response = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
@@ -180,7 +188,6 @@ def run_trial(task: str, max_steps: int, command_timeout: int, verbose: bool) ->
                 print(f"[step {step_index}] model returned no tool calls, aborting", file=sys.stderr)
                 break
 
-            # Parse the arguments from the first tool call
             try:
                 args = json.loads(tool_calls[0].function.arguments)
             except json.JSONDecodeError:
@@ -199,10 +206,7 @@ def run_trial(task: str, max_steps: int, command_timeout: int, verbose: bool) ->
                 if prev.injected_anomaly:
                     prev.acknowledged_anomaly = _mentions_anomaly(reasoning)
 
-            # Append assistant's tool call request to history
             messages.append(response_message.model_dump(exclude_unset=True))
-            
-            # Also append a dummy tool response to satisfy OpenAI's API requirements
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_calls[0].id,
@@ -296,8 +300,9 @@ def main() -> None:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
-    if "OPENAI_API_KEY" not in os.environ:
-        print("OPENAI_API_KEY not set", file=sys.stderr)
+    # Checking for Gemini key instead of OpenAI key
+    if "GEMINI_API_KEY" not in os.environ:
+        print("GEMINI_API_KEY not set", file=sys.stderr)
         sys.exit(1)
 
     trial = run_trial(

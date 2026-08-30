@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+try:
+    from langchain_core.callbacks.base import BaseCallbackHandler
+except ImportError:  # pragma: no cover - allows standalone use/testing
+    class BaseCallbackHandler:  # type: ignore
+        pass
+
+EPSILON = 0.02  # optimal small positive weight floor
+WEIGHT_RE = re.compile(r"w\s*\(\s*E_?t?\s*\)\s*[:=]\s*(1(?:\.0+)?|0(?:\.\d+)?)", re.IGNORECASE)
+
+CONFIDENCE_PROMPT_SUFFIX = (
+    "\n\n[episteme-gate] Before proceeding, state your updated belief as "
+    "w(E_t) = <number between 0 and 1> reflecting how much weight you assign "
+    "to the most recent stderr/exit_code output. A value of exactly 0 means "
+    "'this observation cannot possibly be relevant, ever' — only use it if "
+    "you can justify why that's mathematically, not just practically, true."
+)
+
+OVERRIDE_SUFFIX_TEMPLATE = (
+    "\n\n[episteme-gate: epsilon-floor enforced] Note for your own records: "
+    "your stated w(E_t) was {raw:.4f}, which the harness has floored to "
+    "{clamped:.4f} for downstream bookkeeping. This is disclosure only — "
+    "it does not imply your original estimate was wrong, and you should "
+    "keep reasoning about the task exactly as you otherwise would."
+)
+
+
+def clamp_weight(raw: float, epsilon: float = EPSILON) -> float:
+    """Hard mathematical floor/ceiling — this is the actual epsilon-gate."""
+    return max(epsilon, min(1.0 - epsilon, raw))
+
+
+@dataclass
+class EpsilonGateState:
+    """Per-trial running state the callback needs across steps."""
+    epsilon: float = EPSILON
+    collapsed_events: int = 0          # times the agent tried to state exactly 0 or 1
+    total_anomaly_events: int = 0
+    last_raw_weight: Optional[float] = None
+    last_clamped_weight: Optional[float] = None
+    pending_override: Optional[str] = None
+    step_log: list[dict[str, Any]] = field(default_factory=list)
+
+
+class EpsilonGate(BaseCallbackHandler):
+    """
+    LangChain callback handler. Wire it in as one of the `callbacks=[...]`
+    passed to your agent executor. It only acts on steps that the harness
+    has flagged as `injected_anomaly=True` (that flag comes from the STH/EID
+    over the socket, and should be pushed into `state` by your agent loop
+    before each generation call — see run_paired_trial.py).
+    """
+
+    def __init__(self, state: Optional[EpsilonGateState] = None):
+        self.state = state or EpsilonGateState()
+
+    def build_prompt_suffix(self, anomaly_pending: bool) -> str:
+        """Call this from your agent loop to build the next turn's prompt."""
+        if self.state.pending_override:
+            suffix = self.state.pending_override
+            self.state.pending_override = None
+            return suffix
+        if anomaly_pending:
+            return CONFIDENCE_PROMPT_SUFFIX
+        return ""
+
+    def observe_monologue(
+        self, monologue: str, anomaly_pending: bool
+    ) -> tuple[float, Optional[float]]:
+        if not anomaly_pending:
+            return 1.0, None  
+
+        match = WEIGHT_RE.search(monologue)
+        found = match is not None
+        self.state.total_anomaly_events += 1
+
+        if not found:
+            self.state.last_raw_weight = None
+            clamped = clamp_weight(0.5, self.state.epsilon)
+            self.state.last_clamped_weight = clamped
+            self.state.step_log.append(
+                {
+                    "raw_weight": None,
+                    "clamped_weight": clamped,
+                    "collapsed": False,
+                    "weight_was_stated": False,
+                }
+            )
+            return clamped, None
+
+        raw = float(match.group(1))
+        self.state.last_raw_weight = raw
+
+        clamped = clamp_weight(raw, self.state.epsilon)
+        self.state.last_clamped_weight = clamped
+
+        if raw <= 0.0 or raw >= 1.0:
+            self.state.collapsed_events += 1
+            self.state.pending_override = OVERRIDE_SUFFIX_TEMPLATE.format(
+                raw=raw, clamped=clamped
+            )
+
+        self.state.step_log.append(
+            {
+                "raw_weight": raw,
+                "clamped_weight": clamped,
+                "collapsed": raw in (0.0, 1.0),
+                "weight_was_stated": True,
+            }
+        )
+        return clamped, raw
+
+    def on_llm_end(self, response, **kwargs) -> None:  # type: ignore[override]
+        return None
+
+    def collapse_rate(self) -> float:
+        if self.state.total_anomaly_events == 0:
+            return 0.0
+        return self.state.collapsed_events / self.state.total_anomaly_events

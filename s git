@@ -1,0 +1,29 @@
+[33mcommit 9e3823227fd3bf3b49f384ce4fb4ba876e9793d5[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: Anshika Lamba <anshikalamba.07@gmail.com>
+Date:   Thu Aug 27 14:01:37 2026 +0530
+
+    Update mini_episteme.py
+
+[33mcommit 5b72c9fc4fd1bcfb38da5443e9f3192fc48dbc5d[m
+Author: Anshika Lamba <anshikalamba.07@gmail.com>
+Date:   Thu Aug 27 09:41:57 2026 +0530
+
+    Update Dockerfile
+
+[33mcommit 18d2c65fdda3ca29ec7d69d9b09dde5de85d24f0[m
+Author: Anshika Lamba <anshikalamba.07@gmail.com>
+Date:   Thu Aug 27 09:39:05 2026 +0530
+
+    Create Dockerfile
+
+[33mcommit 76219ed78b23d3bcd8f8e2cc20a12cd27f576ac3[m
+Author: Anshika Lamba <anshikalamba.07@gmail.com>
+Date:   Thu Aug 27 07:50:54 2026 +0530
+
+    Create README.md
+
+[33mcommit 87fd3a35ce379580a5f3a00a74b28b72a9ec5252[m
+Author: Anshika Lamba <anshikalamba.07@gmail.com>
+Date:   Thu Aug 27 07:41:05 2026 +0530
+
+    Update epsilon_gate.py
