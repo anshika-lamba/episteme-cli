@@ -1,60 +1,86 @@
-import argparse, json, os, sys
-from itertools import product
-from providers import GeminiProvider, QuotaExceededError
-from runner import run_trial
-from tasks import TASKS
-from atif import Trajectory
+import argparse
+import json
+import itertools
+import time
+import providers
+import judge
 
-def get_grids():
-    tasks = list(TASKS.keys())
-    main_grid = list(product(tasks, ["control", "real_skill", "placebo_skill"], ["neutral"], range(10)))
-    abl_a = list(product(tasks, ["control"], ["original"], range(5)))
-    abl_c = list(product(tasks, ["control"], ["no_numeric"], range(5)))
-    return list(set(main_grid + abl_a + abl_c))
+def run_trial(model_name, task_name, condition):
+    # Route to correct provider based on model name
+    if "gemma" in model_name or "gemini" in model_name:
+        provider = providers.GeminiProvider(model_name=model_name)
+    else:
+        provider = providers.GroqProvider(model_name=model_name)
+
+    history = []
+    num_anomalies = 2
+    # Spacing the 2 anomalies apart across the 6 expected steps
+    anomaly_steps = [2, 4] 
+
+    for step in range(1, 7):
+        is_anomaly = (step in anomaly_steps)
+        prompt = f"Task: {task_name} | Step: {step}. "
+        if is_anomaly:
+            prompt += "WARNING: Unexpected state or resource constraint detected. "
+        prompt += 'Respond in JSON with "action" and "relevance" (float 0.0-1.0).'
+        
+        parsed_response = provider.generate(prompt)
+        
+        # Ensure we always have a dictionary to work with
+        if not isinstance(parsed_response, dict):
+            parsed_response = {"error": "parse_failure"}
+            
+        step_data = {
+            "step": step,
+            "is_anomaly": is_anomaly,
+            "action": parsed_response.get("action", "unknown"),
+            "raw": parsed_response
+        }
+        
+        # 1. Behavior classification from judge.py
+        step_data["behavior"] = judge.classify_behavior(step_data)
+        history.append(step_data)
+        
+        # 2. Fixed Relevance Scoring Logic
+        # Writes new relevance onto the previous step if it was injected
+        current_relevance = parsed_response.get("relevance", None)
+        if len(history) > 1 and history[-2].get("is_anomaly") == True:
+            history[-2]["relevance_score"] = current_relevance
+        else:
+            history[-1]["relevance_score"] = current_relevance
+            
+    return history
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
-    parser.add_argument("--rpm", type=int, required=True)
-    parser.add_argument("--tpm", type=int, required=True)
-    parser.add_argument("--rpd", type=int, required=True)
+    parser.add_argument("--rpm", type=int, default=15)
+    parser.add_argument("--tpm", type=int, default=10000)
+    parser.add_argument("--rpd", type=int, default=1000)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
-    completed = set()
-    if os.path.exists(args.out):
-        with open(args.out, "r") as f:
-            for line in f:
-                if not line.strip(): continue
-                traj = Trajectory.from_dict(json.loads(line))
-                meta = traj.metadata
-                completed.add((meta.task_name, meta.condition, meta.prompt_variant, meta.seed))
-                
-    full_grid = get_grids()
-    pending = [t for t in full_grid if t not in completed]
+    # Setup basic tasks to benchmark
+    tasks = ["system_audit", "network_monitor", "log_rotation"]
+    conditions = ["baseline", "experimental"]
     
-    total_trials = len(pending)
-    est_calls = total_trials * 6
-    print(f"--- Pre-flight for {args.model} ---")
-    print(f"Pending Trials   : {total_trials}")
-    print(f"Est. API Calls   : {est_calls}")
-    print(f"------------------------------------")
+    # 3. Fixed Grid Order: list() instead of set() for deterministic execution
+    grid = list(itertools.product(tasks, conditions))
     
-    if total_trials == 0: return
-
-    provider = GeminiProvider(args.model, args.rpm, args.tpm, args.rpd)
-    with open(args.out, "a") as f:
-        for task, cond, var, seed in pending:
-            print(f"Running: Task={task} | Cond={cond} | Var={var} | Seed={seed}...")
-            try:
-                traj = run_trial(provider, task, cond, var, seed)
-                f.write(traj.to_json() + "\n")
-                f.flush()
-            except QuotaExceededError as e:
-                print(f"[!] Quota Reached: {e}. Exiting cleanly.")
-                sys.exit(0)
-            except Exception as e:
-                print(f"[ERROR] Trial failed: {e}")
+    results = []
+    for task, condition in grid:
+        trial_history = run_trial(args.model, task, condition)
+        results.append({
+            "model": args.model,
+            "task": task,
+            "condition": condition,
+            "history": trial_history
+        })
+        time.sleep(2) # Basic rate limiting
+        
+    with open(args.out, "w") as f:
+        for res in results:
+            f.write(json.dumps(res) + "\n")
 
 if __name__ == "__main__":
     main()

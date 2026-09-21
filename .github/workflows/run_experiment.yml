@@ -1,59 +1,25 @@
 name: AAAI-UC Experiment Runner
-on:
-  workflow_dispatch:
-    inputs:
-      model_a:
-        description: 'Model A ID'
-        default: 'gemma-4-26b-a4b-it'
-        required: true
-      model_b:
-        description: 'Model B ID'
-        default: 'gemma-4-31b-it'
-        required: true
-      rpm:
-        description: 'RPM Limit'
-        default: '21'
-      tpm:
-        description: 'TPM Limit'
-        default: '11200'
-      rpd:
-        description: 'RPD Limit'
-        default: '12960'
-
+on: workflow_dispatch
 jobs:
   run-trials:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       matrix:
-        model: [ "${{ github.event.inputs.model_a }}", "${{ github.event.inputs.model_b }}" ]
-      max-parallel: 2
-      fail-fast: false
+        model: [gemma-4-26b-a4b-it, gemma-4-31b-it]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
-      - run: pip install pytest requests
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: results-${{ matrix.model }}
-          path: ./
-      - run: |
-          python run_experiment.py \
-            --model ${{ matrix.model }} \
-            --rpm ${{ github.event.inputs.rpm }} \
-            --tpm ${{ github.event.inputs.tpm }} \
-            --rpd ${{ github.event.inputs.rpd }} \
-            --out ${{ matrix.model }}_results.jsonl
+      - run: pip install google-generativeai groq requests pytest
+      - name: Run experiment
+        run: python run_experiment.py --model ${{ matrix.model }} --rpm 15 --tpm 10000 --rpd 1000 --out ${{ matrix.model }}_results.jsonl
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      - if: always()
+      - name: Upload Artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results-${{ matrix.model }}
+          name: results-${{ matrix.model }}-${{ github.run_id }}
           path: ${{ matrix.model }}_results.jsonl
           retention-days: 14
-      - name: Run experiment
-        run: python run_experiment.py --model ${{ matrix.model }}
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
