@@ -6,7 +6,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       matrix:
-        model: [gemma-4-26b-a4b-it, gemma-4-31b-it]
+        model: [gemini-1.5-flash, llama3-8b-8192]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -16,6 +16,7 @@ jobs:
         run: python run_experiment.py --model ${{ matrix.model }} --rpm 15 --tpm 10000 --rpd 1000 --out ${{ matrix.model }}_results.jsonl
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       - name: Upload Artifact
         if: always()
         uses: actions/upload-artifact@v4
