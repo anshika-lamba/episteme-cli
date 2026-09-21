@@ -1,15 +1,18 @@
-# Preregistration: Epistemic Rigidity in LLM Agents
+# Preregistration: LLM Epistemic Rigidity
 
-## 1. Hypotheses
-*   **H1 (Confidence Collapse):** Under a neutral prompt, LLM agents in a shell environment will exhibit a non-zero "exact-zero collapse rate," assigning mathematically absolute 0.0 relevance to actionable anomaly signals.
-*   **H2 (Verbal-Behavioral Gap):** There will be a measurable divergence between an agent's stated relevance and its behavioral execution.
-*   **H3 (Intervention Efficacy):** Explicit methodological instructions (Skill) will significantly reduce the down-collapse rate compared to a control group and a placebo.
+## 1. Hypothesis
+Resource-constrained LLM agents will exhibit epistemic rigidity (exact-zero collapse) when encountering unexpected anomalies in standard IT operational tasks. Regardless of corporate alignment (Gemma vs Llama-3), agents will default to "ignore" or "continue_task" behaviors rather than halting or investigating.
 
-## 2. Experimental Design
-*   **Models:** gemma-4-26b-a4b-it, gemma-4-31b-it.
-*   **Conditions:** Control, Real Skill (epistemic hygiene), Placebo Skill.
-*   **Prompt Variants:** Original (demand-heavy), Neutral, No-Numeric (behavior only).
+## 2. Methodology
+* **Task Structure:** 6-step sequential system operations (e.g., log rotation, system audit).
+* **Anomalies:** 2 injected warnings at unexpected intervals (steps 2 and 4).
+* **Models:** `gemini-1.5-flash` and `llama3-8b-8192`.
+* **Prompting:** Zero-shot JSON generation requesting an `action` and `relevance` score (0.0 - 1.0).
 
-## 3. Metrics & Analysis
-*   **Primary Metric:** Down-Collapse Rate (stated relevance <= 0.02 on `should_act` anomalies).
-*   **Judge Validation:** LLM Judge (gemini-3.6-flash) evaluated via Cohen's Kappa against a 50-sample human-labeled dataset, requiring kappa > 0.60 for validity.
+## 3. Metrics
+* **Behavior Distribution:** Categorical classification of the `action` output (investigate, ignore, escalate, continue_task) using a command-matching judge.
+* **AUROC:** The area under the ROC curve comparing `relevance_score` outputs during anomaly steps (positives) vs standard steps (negatives).
+* **Exact-Zero Gap:** Difference between mean anomaly relevance and mean baseline relevance.
+
+## 4. Exclusions
+Any trial step resulting in a malformed JSON output (`"error": "parse_failure"`) will be recorded for reliability tracking but strictly excluded from the AUROC and behavior distribution calculations.
