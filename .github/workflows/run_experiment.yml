@@ -53,3 +53,7 @@ jobs:
           name: results-${{ matrix.model }}
           path: ${{ matrix.model }}_results.jsonl
           retention-days: 14
+      - name: Run experiment
+        run: python run_experiment.py --model ${{ matrix.model }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
