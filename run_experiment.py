@@ -6,7 +6,6 @@ import providers
 import judge
 
 def run_trial(model_name, task_name, condition):
-    # Route to correct provider based on model name
     if "gemma" in model_name or "gemini" in model_name:
         provider = providers.GeminiProvider(model_name=model_name)
     else:
@@ -14,7 +13,6 @@ def run_trial(model_name, task_name, condition):
 
     history = []
     num_anomalies = 2
-    # Spacing the 2 anomalies apart across the 6 expected steps
     anomaly_steps = [2, 4] 
 
     for step in range(1, 7):
@@ -26,7 +24,6 @@ def run_trial(model_name, task_name, condition):
         
         parsed_response = provider.generate(prompt)
         
-        # Ensure we always have a dictionary to work with
         if not isinstance(parsed_response, dict):
             parsed_response = {"error": "parse_failure"}
             
@@ -37,12 +34,14 @@ def run_trial(model_name, task_name, condition):
             "raw": parsed_response
         }
         
-        # 1. Behavior classification from judge.py
-        step_data["behavior"] = judge.classify_behavior(step_data)
+        try:
+            step_data["behavior"] = judge.classify_behavior(step_data)
+        except Exception as e:
+            step_data["behavior"] = "judge_crash"
+            step_data["raw"]["judge_error"] = str(e)
+            
         history.append(step_data)
         
-        # 2. Fixed Relevance Scoring Logic
-        # Writes new relevance onto the previous step if it was injected
         current_relevance = parsed_response.get("relevance", None)
         if len(history) > 1 and history[-2].get("is_anomaly") == True:
             history[-2]["relevance_score"] = current_relevance
@@ -60,11 +59,9 @@ def main():
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
-    # Setup basic tasks to benchmark
     tasks = ["system_audit", "network_monitor", "log_rotation"]
     conditions = ["baseline", "experimental"]
     
-    # 3. Fixed Grid Order: list() instead of set() for deterministic execution
     grid = list(itertools.product(tasks, conditions))
     
     results = []
@@ -76,7 +73,7 @@ def main():
             "condition": condition,
             "history": trial_history
         })
-        time.sleep(2) # Basic rate limiting
+        time.sleep(2) 
         
     with open(args.out, "w") as f:
         for res in results:

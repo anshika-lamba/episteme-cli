@@ -5,6 +5,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
         model: [gemini-1.5-flash, llama3-8b-8192]
     steps:
