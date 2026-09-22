@@ -1,5 +1,21 @@
 import os, shutil, tempfile, subprocess
 from dataclasses import dataclass
+from typing import List, Optional
+
+# Task scripts are POSIX shell (printf/touch/md5sum/tar/sed, `[ ! -f ]`, /dev/null).
+# On POSIX, shell=True gives /bin/sh and everything works. On Windows, shell=True is
+# cmd.exe and EVERY command "fails" with 'not recognized', which would poison the whole
+# grid as model behaviour. set_shell() routes all task scripts through a real POSIX shell
+# (Git-Bash `bash -lc`, or `wsl -e bash -lc`); run_grid.py resolves this automatically and
+# refuses to start if no POSIX shell + coreutils are available.
+_SHELL_PREFIX: Optional[List[str]] = None
+
+def set_shell(prefix: Optional[List[str]]) -> None:
+    global _SHELL_PREFIX
+    _SHELL_PREFIX = list(prefix) if prefix else None
+
+def shell_is_posix() -> bool:
+    return os.name != "nt" or _SHELL_PREFIX is not None
 
 @dataclass
 class TaskDef:
@@ -59,19 +75,26 @@ class TaskEnv:
             if any(sec in k.upper() for sec in ["KEY", "TOKEN", "SECRET"]):
                 del self.env[k]
         
-    def setup(self): subprocess.run(self.task.setup_script, shell=True, cwd=self.dir, env=self.env, check=True)
+    def _spawn(self, script: str, **kw):
+        if _SHELL_PREFIX:
+            return subprocess.run(_SHELL_PREFIX + [script], **kw)
+        return subprocess.run(script, shell=True, **kw)
+
+    def setup(self):
+        return self._spawn(self.task.setup_script, cwd=self.dir, env=self.env, check=True,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
         
     def run_cmd(self, cmd: str, timeout: int = 10) -> tuple:
         try:
-            res = subprocess.run(cmd, shell=True, cwd=self.dir, env=self.env, capture_output=True, text=True, timeout=timeout)
+            res = self._spawn(cmd, cwd=self.dir, env=self.env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
             return scrub_secrets(res.stdout), scrub_secrets(res.stderr), res.returncode, False
         except subprocess.TimeoutExpired as e:
-            out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-            err = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+            out = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+            err = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
             return scrub_secrets(out), scrub_secrets(err), -124, True
             
     def check_success(self) -> bool:
-        res = subprocess.run(self.task.success_script, shell=True, cwd=self.dir, env=self.env)
+        res = self._spawn(self.task.success_script, cwd=self.dir, env=self.env, capture_output=True, text=True, encoding="utf-8", errors="replace")
         return res.returncode == 0
         
     def cleanup(self): shutil.rmtree(self.dir, ignore_errors=True)

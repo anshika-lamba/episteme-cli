@@ -101,9 +101,15 @@ Still open (`[DECIDE]` in PREREG.md):
   the moment the pilot file is committed: `git add results/pilot_groq_allam-2-7b.jsonl && git
   commit -m "pilot" && git push` (any filename under `results/` works; `stats.py` re-derives the
   response relevance on load).
-* **GitHub Actions** (`.github/workflows/run_experiment.yml`) runs `run_grid.py` with the repo
-  secrets and **commits `results/*.jsonl` back to this branch** after each job, so runs are
-  resumable across days and analysable from anywhere. Dispatch:
+* **Decided 2026-09-22: the author runs `run_grid.py` locally on Windows (PowerShell).** The
+  harness now routes all task scripts through a POSIX shell (auto-detected `wsl`/Git-bash;
+  `--sandbox-shell` to force) and runs a quota-free preflight (shell echo probe, 8 required
+  tools, all 4 task setups) that refuses to start rather than burn 2,000 calls on a dead
+  sandbox. Push `results/` (incl. `harness_*.jsonl`) to this branch after/while running and the
+  analysis side (stats, sampling, kappa) can run anywhere; runs resume from committed files.
+* (Fallback, unused for now) GitHub Actions (`.github/workflows/run_experiment.yml`) runs
+  `run_grid.py` with the repo secrets and commits `results/*.jsonl` back to the dispatched
+  branch. Dispatch:
   `gh workflow run run_experiment.yml --ref arena/01a0c97b-episteme-cli -f provider=gemini -f pilot=true`
   (then `-f seeds=7` for the grid). `.quota/` is ephemeral in Actions — server-side per-day
   429s still stop the run cleanly; **run Cohere from one machine, never from Actions.**

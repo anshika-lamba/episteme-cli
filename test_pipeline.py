@@ -13,6 +13,7 @@ import pytest
 import providers
 from providers import (extract_last_json, ParseError, ProviderError, QuotaExceededError, RateLimiter, CallLedger,
                        GroqProvider, GeminiProvider, CohereProvider, MistralProvider, make_provider, REGISTRY)
+from runner import run_trial
 from run_grid import build_plan, existing_trial_ids, ALL_TASKS, ALL_CONDITIONS, ALL_VARIANTS
 from metrics import compute_auroc
 import stats
@@ -413,3 +414,46 @@ def test_model_limits_override_registry_defaults(monkeypatch, tmp_path):
     assert p.limiter.rpm == 10 and p.limiter.rpd_limit == 250
     p2 = make_provider("gemini", "gemini-2.5-flash", rpd=99, ledger_dir=str(tmp_path))
     assert p2.limiter.rpd_limit == 99                                     # explicit flag wins
+
+
+# --------------------------------------------------------------------------- #
+# Windows/local-run hardening
+# --------------------------------------------------------------------------- #
+def test_run_grid_shared_overrides_reach_every_provider(monkeypatch, tmp_path):
+    """Regression: run_grid passes ONE overrides dict (incl. mock-only seed=0) to every
+    provider; make_provider must accept it for real providers too, not just mock."""
+    overrides = dict(rpm=None, tpm=None, rpd=None, min_interval_s=None, monthly_cap=None,
+                     temperature=0.0, max_output_tokens=400, json_mode=None, seed=0, ledger_dir=str(tmp_path))
+    for name, key in (("groq", "GROQ_API_KEY"), ("gemini", "GEMINI_API_KEY"), ("mistral", "MISTRAL_API_KEY"), ("cohere", "COHERE_API_KEY")):
+        monkeypatch.setenv(key, "k")
+        p = make_provider(name, None, **overrides)
+        assert p.temperature == 0.0 and p.max_output_tokens == 400 and p.ledger is not None
+    p_mock = make_provider("mock", None, **overrides)  # seed honoured here, dropped for real providers
+    assert p_mock.__class__.__name__ == "ScriptedMockProvider" and p_mock.base_seed == 0
+    with pytest.raises(ProviderError, match="Unknown option 'nonsense'"):
+        make_provider("groq", None, nonsense=1)
+
+
+def test_sandbox_setup_failure_is_recorded_not_raised():
+    """A broken environment aborts the trial with a clear reason; the grid keeps running."""
+    import tasks as tasks_mod
+    from mock_provider import ScriptedMockProvider
+    saved = tasks_mod._SHELL_PREFIX
+    tasks_mod.set_shell(["/definitely/not/a/shell-xyz"])
+    try:
+        traj = run_trial(ScriptedMockProvider(seed=0), "log_rotation", "control", "neutral", 0)
+    finally:
+        tasks_mod.set_shell(saved)
+    assert traj.metadata.aborted_reason.startswith("sandbox_setup_failed")
+    assert traj.steps == []
+
+
+def test_run_grid_preflight_flags_missing_posix_shell(tmp_path):
+    env = dict(os.environ, PYTHONPATH=os.getcwd())
+    out = tmp_path / "p.jsonl"
+    r = subprocess.run([sys.executable, "run_grid.py", "--provider", "mock", "--pilot", "--dry-run",
+                        "--sandbox-shell", "/definitely/not/a/shell-xyz", "--out", str(out)], capture_output=True, text=True, env=env)
+    assert r.returncode == 1 and "does not work" in r.stderr  # an explicit broken shell fails even in dry-run
+    r2 = subprocess.run([sys.executable, "run_grid.py", "--provider", "mock", "--max-trials", "1",
+                         "--sandbox-shell", "/definitely/not/a/shell-xyz", "--out", str(out)], capture_output=True, text=True, env=env)
+    assert r2.returncode == 1 and "sandbox" in (r2.stderr + r2.stdout).lower()

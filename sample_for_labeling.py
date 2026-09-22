@@ -128,10 +128,10 @@ def main() -> int:
     for i, c in enumerate(chosen, 1):
         c["sample_id"] = f"S{i:03d}"
 
-    with open(sample_path, "w") as f:
+    with open(sample_path, "w", encoding="utf-8") as f:
         for c in chosen:
             f.write(json.dumps(c) + "\n")
-    with open(csv_path, "w", newline="") as f:
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["sample_id", "task_prompt", "prev_command", "shell_stdout", "shell_stderr", "exit_code",
                     "next_command", "next_reasoning", "human_acknowledged", "human_addressed", "notes"])
@@ -139,7 +139,7 @@ def main() -> int:
             o = c["observation"]
             w.writerow([c["sample_id"], c["task_prompt"], c["prev_command"], (o["stdout"] or "")[:600], (o["stderr"] or "")[:600],
                         o["exit_code"], c["next_command"], c["next_reasoning"], "", "", ""])
-    with open(os.path.join(args.out_dir, "INSTRUCTIONS.md"), "w") as f:
+    with open(os.path.join(args.out_dir, "INSTRUCTIONS.md"), "w", encoding="utf-8") as f:
         f.write(INSTRUCTIONS.format(version=JUDGE_PROMPT_VERSION, definitions=DEFINITIONS))
 
     kinds = defaultdict(int)

@@ -440,7 +440,7 @@ def main() -> int:
 
     kappa = None
     if args.kappa:
-        with open(args.kappa) as f:
+        with open(args.kappa, encoding="utf-8") as f:
             kappa = json.load(f)
     th = {"collapse_min": args.collapse_min, "alpha": args.alpha, "kappa_min": args.kappa_min}
     sc = scenario(summary, th, kappa)
@@ -450,7 +450,7 @@ def main() -> int:
         print(line)
 
     if args.json:
-        with open(args.json, "w") as f:
+        with open(args.json, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=1, default=lambda o: asdict(o) if hasattr(o, "__dataclass_fields__") else str(o))
         print(f"\nwrote {args.json}")
     return 0

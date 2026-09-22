@@ -29,7 +29,7 @@ class JsonlSink:
         self.path = path
         self.events: List[Dict[str, Any]] = []
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self._f = open(path, "a")
+        self._f = open(path, "a", encoding="utf-8")
         self._write({"layer": "run", "kind": "run_start", **(run_meta or {})})
 
     def _write(self, ev: Dict[str, Any]) -> None:
@@ -68,7 +68,7 @@ def load_events(patterns: List[str]) -> List[Dict[str, Any]]:
         for path in sorted(glob.glob(pat)) or [pat]:
             if not os.path.exists(path):
                 continue
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 for line in f:
                     if line.strip():
                         events.append(json.loads(line))
@@ -113,7 +113,7 @@ def main() -> int:
         for e in fatal[:8]:
             print(f"  {e.get('ts')} {e.get('provider')}/{e.get('model')} {e.get('kind')} {e.get('http_status', '')} {str(e.get('body') or e.get('error') or e.get('detail'))[:140]!r}")
     if args.json:
-        with open(args.json, "w") as f:
+        with open(args.json, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=1)
         print(f"\nwrote {args.json}")
     return 0

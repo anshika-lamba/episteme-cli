@@ -27,11 +27,15 @@ import os
 import random
 import sys
 import time
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
+
+import shutil
+import subprocess
 
 from providers import make_provider, list_models, ProviderError, QuotaExceededError, REGISTRY, effective_limits
 from harness_summary import JsonlSink, summarize_events
-from tasks import TASKS
+import tasks as tasks_mod
+from tasks import TASKS, TaskEnv
 from runner import run_trial
 
 ALL_TASKS = list(TASKS.keys())                       # python_test, config_health, checksum_build, log_rotation
@@ -42,6 +46,61 @@ PILOT_TASKS = ["python_test", "log_rotation"]
 # (control vs real_skill) and both numeric variants across all tasks.
 PRIORITY = dict(tasks=ALL_TASKS, conditions=["control", "real_skill"], variants=["original", "neutral"])
 CALLS_PER_TRIAL_EST = 8  # planning figure: <= max_steps (10); typical 5-8
+
+
+REQUIRED_TOOLS = ["python3", "md5sum", "tar", "sed", "printf", "touch", "grep", "cat"]  # used by the 4 task scripts
+OPTIONAL_TOOLS = ["pytest"]
+
+
+def resolve_sandbox_shell(choice: str) -> Optional[list]:
+    """Return a prefix like ["bash", "-lc"], or None for native shell=True (fine on POSIX)."""
+    if os.name != "nt" and choice == "auto":
+        return None  # /bin/sh is already POSIX
+    candidates = []
+    if choice not in ("auto", "native"):
+        candidates = [[choice, "-lc"]] if shutil.which(choice) or os.path.sep in choice else []
+    elif os.name == "nt":
+        candidates = [["wsl", "-e", "bash", "-lc"], ["bash", "-lc"], ["sh", "-lc"]]
+    for pref in candidates:
+        try:
+            r = subprocess.run(pref + ['echo __EPISTEME_SHELL_OK__'], capture_output=True, text=True, timeout=30)
+            if "__EPISTEME_SHELL_OK__" in (r.stdout or ""):
+                return pref
+        except Exception:
+            continue
+    return None
+
+
+def preflight() -> list:
+    """Cheap, quota-free checks that the sandbox works HERE, before burning 2,000 API calls.
+    On Windows this is what catches 'cmd.exe cannot run the POSIX task scripts'."""
+    problems, warns = [], []
+    env = TaskEnv(TASKS["log_rotation"])
+    probe = lambda cmd: env.run_cmd(cmd, timeout=30)
+    try:
+        env.setup()
+        out, err, code, _ = probe("printf ok > p.txt && [ -s p.txt ] && echo OK")
+        if "OK" not in out:
+            problems.append(f"sandbox shell cannot run POSIX commands (exit {code}, stderr: {err.strip()[:160]})")
+        for tool in REQUIRED_TOOLS + OPTIONAL_TOOLS:
+            out, _e, code, _ = probe(f"command -v {tool} >/dev/null 2>&1 && echo FOUND")
+            if "FOUND" not in out:
+                (warns if tool in OPTIONAL_TOOLS else problems).append(f"missing tool: {tool}")
+        for t in TASKS.values():  # every task must set up and not trivially succeed
+            te = TaskEnv(t)
+            try:
+                te.setup()
+                if te.check_success():
+                    warns.append(f"task {t.name!r} SUCCEEDS right after setup (env problem? a model acing it proves nothing)")
+            except Exception as e:
+                problems.append(f"task {t.name!r} setup failed: {str(e)[:160]}")
+            finally:
+                te.cleanup()
+    finally:
+        env.cleanup()
+    for w in warns:
+        print(f"[preflight][warn] {w}", file=sys.stderr)
+    return problems
 
 
 def build_plan(tasks: List[str], conditions: List[str], variants: List[str], seeds: List[int]) -> List[Tuple[str, str, str, int]]:
@@ -111,6 +170,8 @@ def main() -> int:
     ap.add_argument("--list-models", action="store_true")
     ap.add_argument("--mock-seed", type=int, default=0)
     ap.add_argument("--harness-log", default=None, help="JSONL of harness-level events (429/5xx/parse failures/quota); default results/harness_{provider}_{model}.jsonl")
+    ap.add_argument("--sandbox-shell", default="auto", help="auto|native|<path to bash/sh>: on Windows 'auto' tries wsl, Git-bash, sh (tasks need POSIX; cmd.exe cannot run them)")
+    ap.add_argument("--no-preflight", action="store_true", help="skip the 2-second sandbox sanity checks (not recommended)")
     args = ap.parse_args()
 
     if args.list_models:
@@ -154,6 +215,27 @@ def main() -> int:
         print(f"limits: rpm={rpm} tpm={args.tpm or spec['tpm']} rpd={rpd} min_interval={args.min_interval or spec['min_interval_s']}s "
               f"monthly_cap={args.monthly_cap or spec.get('monthly_cap')} | {REGISTRY[args.provider]['notes']}", file=sys.stderr)
         print(f"budget: >= {est_calls / rpm:.0f} min at the RPM ceiling; >= {est_calls / rpd:.1f} days at the RPD cap", file=sys.stderr)
+    if not args.no_preflight:
+        shell = resolve_sandbox_shell(args.sandbox_shell)
+        if shell is None and args.sandbox_shell not in ("auto", "native") and os.name != "nt":
+            # explicit --sandbox-shell that cannot even echo a marker: fail loudly, never silently native
+            print(f"[preflight] FAIL: --sandbox-shell {args.sandbox_shell!r} does not work (failed the echo probe)", file=sys.stderr)
+            return 1
+        if shell is None and os.name == "nt":
+            print("[preflight] Windows: no POSIX shell found (tried wsl, bash, sh); falling back to cmd.exe, which will fail the task checks below. Install Git for Windows or use WSL.", file=sys.stderr)
+        if shell:
+            print(f"[preflight] routing sandbox commands through: {shell[0]}", file=sys.stderr)
+        tasks_mod.set_shell(shell)
+        problems = preflight()
+        if problems:
+            print("[preflight] FAIL — refusing to start (nothing wasted):", file=sys.stderr)
+            for pr in problems:
+                print(f"  - {pr}", file=sys.stderr)
+            print("Fix: install Git for Windows (bash) or use WSL:  wsl python run_grid.py ...  — or pass --sandbox-shell <path to bash.exe>. "
+                  "Only bypass with --no-preflight if you know what you are doing.", file=sys.stderr)
+            return 1
+        print("[preflight] sandbox OK (shell + tools + all 4 task setups)", file=sys.stderr)
+
     if args.dry_run:
         for i, (task, cond, var, seed) in enumerate(todo[:12]):
             print(f"  {i:3d} {task:15s} {cond:14s} {var:10s} seed={seed}")
@@ -185,7 +267,7 @@ def main() -> int:
     t_start = time.time()
     n_done = n_aborted = 0
     stop_reason = None
-    with open(out, "a") as f:
+    with open(out, "a", encoding="utf-8") as f:
         try:
             for i, (task, cond, var, seed) in enumerate(todo):
                 calls_before = getattr(provider, "total_calls", 0)
@@ -224,7 +306,7 @@ def main() -> int:
     sink.close(summary)
     print(json.dumps(summary, indent=2), file=sys.stderr)
     try:
-        total_lines = sum(1 for line in open(out) if line.strip())
+        total_lines = sum(1 for line in open(out, encoding="utf-8") if line.strip())
         print(f"{out}: {total_lines} lines", file=sys.stderr)
     except OSError:
         pass

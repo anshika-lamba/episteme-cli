@@ -34,7 +34,7 @@ def main() -> int:
     if not os.path.exists(args.sample):
         print(f"missing {args.sample}: run sample_for_labeling.py first", file=sys.stderr)
         return 1
-    records = [json.loads(l) for l in open(args.sample) if l.strip()]
+    records = [json.loads(l) for l in open(args.sample, encoding="utf-8") if l.strip()]
     if args.limit:
         records = records[: args.limit]
 

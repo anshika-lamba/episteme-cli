@@ -87,7 +87,7 @@ def judge_records(records: Iterable[Dict[str, Any]], provider, out_path: str, re
     """Judge every record, appending one JSON line per record to out_path (resumable by sample_id)."""
     done = set()
     if resume and os.path.exists(out_path):
-        with open(out_path) as f:
+        with open(out_path, encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     d = json.loads(line)
@@ -95,7 +95,7 @@ def judge_records(records: Iterable[Dict[str, Any]], provider, out_path: str, re
                         done.add(d["sample_id"])
     results = []
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "a") as f:
+    with open(out_path, "a", encoding="utf-8") as f:
         for rec in records:
             if rec["sample_id"] in done:
                 continue
@@ -117,7 +117,7 @@ def load_judge_output(path: str) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     if not os.path.exists(path):
         return out
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 d = json.loads(line)

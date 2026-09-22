@@ -93,10 +93,10 @@ def main() -> int:
     args = ap.parse_args()
     rng = random.Random(args.seed)
 
-    sample = {json.loads(l)["sample_id"]: json.loads(l) for l in open(args.sample) if l.strip()}
+    sample = {json.loads(l)["sample_id"]: json.loads(l) for l in open(args.sample, encoding="utf-8") if l.strip()}
     judge = load_judge_output(args.judge)
     human: Dict[str, Dict[str, Optional[bool]]] = {}
-    with open(args.labels, newline="") as f:
+    with open(args.labels, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             human[row["sample_id"]] = {"acknowledged": parse_label(row.get("human_acknowledged", "")),
                                        "addressed": parse_label(row.get("human_addressed", ""))}
@@ -159,7 +159,7 @@ def main() -> int:
     if not out["passed"]:
         print("If FAIL: revise judge.py prompt (bump JUDGE_PROMPT_VERSION), re-run run_judge.py --no-resume, re-run kappa.py.\n"
               "If it still fails: report it as a limitation; relevance-based metrics do not depend on the judge.")
-    with open(args.json, "w") as f:
+    with open(args.json, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=1)
     print(f"wrote {args.json}")
     return 0

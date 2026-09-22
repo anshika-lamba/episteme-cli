@@ -15,8 +15,6 @@ def run_trial(provider, task_name: str, condition: str, variant: str, seed: int,
     are returned with `metadata.aborted_reason` set (QuotaExceeded is flagged so the
     grid runner can stop the whole run)."""
     task = TASKS[task_name]
-    env = TaskEnv(task)
-    env.setup()
     schedule = generate_schedule(seed, task_name, expected_steps, max_steps)
     meta = TrialMetadata(
         f"{task_name}_{condition}_{variant}_{seed}", provider.model_name, task_name, condition, variant, seed,
@@ -24,6 +22,15 @@ def run_trial(provider, task_name: str, condition: str, variant: str, seed: int,
         started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
     )
     traj = Trajectory(meta)
+    env = TaskEnv(task)
+    try:
+        env.setup()
+    except Exception as e:
+        # Broken sandbox (e.g. no POSIX shell on Windows) must not look like model behaviour
+        # and must not kill the grid: record it and move on.
+        traj.metadata.aborted_reason = f"sandbox_setup_failed: {str(e)[:200]}"
+        traj.metadata.task_success = False
+        return traj
     history = [{"role": "user", "content": build_system_prompt(task.prompt, condition, variant)}]
     consecutive_failures = 0
 

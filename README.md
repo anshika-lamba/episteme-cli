@@ -26,12 +26,15 @@ is the command + `relevance` it emits at step *k+1*; that is what every metric s
 
 ## Setup
 
-```bash
-pip install -r requirements.txt          # requests + pytest only; no vendor SDKs
-export GROQ_API_KEY=... GEMINI_API_KEY=... MISTRAL_API_KEY=... COHERE_API_KEY=...
-python -m pytest -q                      # 53 offline tests
-python run_grid.py --provider mock --pilot && python stats.py results/pilot_mock_mock-model.jsonl   # smoke test, no keys
+```powershell
+# Windows PowerShell (the task sandbox needs a POSIX shell: WSL, or Git for Windows' bash -
+# run_grid.py's preflight finds one automatically and refuses to start if none works)
+pip install -r requirements.txt           # requests + pytest only; no vendor SDKs
+$env:GROQ_API_KEY="..."; $env:GEMINI_API_KEY="..."; $env:MISTRAL_API_KEY="..."; $env:COHERE_API_KEY="..."
+python -m pytest -q                       # 59 offline tests
+python run_grid.py --provider mock --pilot; python stats.py results/pilot_mock_mock-model.jsonl   # smoke test, no keys
 ```
+or on Linux/macOS/Termux: `export GROQ_API_KEY=... GEMINI_API_KEY=... MISTRAL_API_KEY=... COHERE_API_KEY=...`
 
 ## Commands by phase
 

@@ -25,6 +25,7 @@ Public API (used by runner.py / run_grid.py / judge.py / tests)
 from __future__ import annotations
 
 import datetime as _dt
+import inspect
 import json
 import os
 import re
@@ -161,7 +162,7 @@ class CallLedger:
         if not os.path.exists(self.path):
             return {"months": {}, "days": {}}
         try:
-            with open(self.path) as f:
+            with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
             return {"months": {}, "days": {}}
@@ -193,7 +194,7 @@ class CallLedger:
         # keep the file small
         data["days"] = {k: v for k, v in sorted(data["days"].items())[-45:]}
         tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
         os.replace(tmp, self.path)
 
@@ -616,20 +617,37 @@ def effective_limits(name: str, model: Optional[str]) -> Dict[str, Any]:
     return spec
 
 
+# Knobs that only the offline mock understands; run_grid passes one shared overrides dict.
+MOCK_ONLY_OVERRIDES = ("seed", "behavior", "parse_fail_p")
+
+
 def make_provider(name: str, model: Optional[str] = None, **overrides: Any) -> BaseProvider:
-    """Instantiate a provider by registry name. `mock` is handled in mock_provider.py."""
+    """Instantiate a provider by registry name. `mock` is handled in mock_provider.py.
+
+    Unknown options for a real provider raise ProviderError instead of TypeError,
+    and mock-only knobs (e.g. --mock-seed) are dropped silently so `--provider groq`
+    and `--provider mock` accept the same CLI surface."""
     if name == "mock":
         from mock_provider import ScriptedMockProvider  # local import: keeps providers.py dependency-free
-        return ScriptedMockProvider(model_name=model or "mock-model", **{k: v for k, v in overrides.items() if k in ("seed", "behavior")})
+        kw = {k: v for k, v in overrides.items() if k in MOCK_ONLY_OVERRIDES and v is not None}
+        return ScriptedMockProvider(model_name=model or "mock-model", **kw)
     if name not in REGISTRY:
         raise ProviderError(f"Unknown provider '{name}'. Choose from: {', '.join(REGISTRY)} or mock.")
     cls = REGISTRY[name]["cls"]
+    accepted = set(inspect.signature(BaseProvider.__init__).parameters) - {"self"}
     spec = effective_limits(name, model)
-    spec.update({k: v for k, v in overrides.items() if v is not None})
+    for k, v in overrides.items():
+        if v is None or k in MOCK_ONLY_OVERRIDES:
+            continue
+        if k not in accepted:
+            raise ProviderError(f"Unknown option '{k}' for provider '{name}'. Accepted: {', '.join(sorted(accepted))}.")
+        spec[k] = v
     return cls(model_name=model or cls.default_model, **spec)
 
 
 def list_models(name: str) -> List[str]:
+    if name == "mock":
+        raise ProviderError("mock has no model list")
     prov = make_provider(name)
     if not hasattr(prov, "list_models"):
         return []
