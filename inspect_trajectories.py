@@ -42,7 +42,9 @@ def degeneracy_report(trajs) -> None:
         sched = sum(len(t.metadata.scheduled_anomalies) for t in ts)
         print(f"\n### {model}: {len(ts)} trials, {n_steps} steps ({n_steps / len(ts):.1f}/trial), task success {succ}/{len(ts)}, "
               f"anomalies fired {fired}/{sched}, aborted {sum(1 for t in ts if t.metadata.aborted_reason)}")
-        print(f"  parse failures: {parse_failed}/{n_steps} ({parse_failed / max(1, n_steps):.1%}); provider errors: {prov_err}; "
+        collapsed = sum(1 for t in ts for s in t.steps if s.injected_anomaly and s.parse_fail)
+        print(f"  parse failures: {parse_failed}/{n_steps} ({parse_failed / max(1, n_steps):.1%}); "
+              f"anomaly evaluations collapsed (rel=null, not scored): {collapsed}; provider errors: {prov_err}; "
               f"DONE as first action: {done_first}; hit max steps without DONE: {max_steps_hit}")
         flags = []
         if n_steps and parse_failed / n_steps > 0.2:

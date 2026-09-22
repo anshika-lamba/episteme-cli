@@ -69,11 +69,11 @@ def test_pure_python_auroc():
     assert math.isclose(compute_auroc([True, True, False, False], [0.8, 0.4, 0.1, 0.4]), 0.875)
 
 def test_json_extractor():
-    t1 = "I think I should list files.\n```json\n{\"command\": \"ls\", \"relevance\": 0.5}\n```"
-    assert extract_last_json(t1, "neutral")["command"] == "ls"
-    
-    parsed_trail = extract_last_json('{"command": "ls", "relevance": 0.5} {}', "neutral")
-    assert parsed_trail["command"] == "ls" and parsed_trail["relevance"] == 0.5
+    assert extract_last_json('{"command": "ls", "relevance": 0.5}', "neutral")["command"] == "ls"
+    with pytest.raises(ParseError, match="Formatting collapse"):
+        extract_last_json('{"command": "ls", "relevance": 0.5} {}', "neutral")
+    with pytest.raises(ParseError, match="Formatting collapse"):
+        extract_last_json("```json\n{\"command\": \"ls\", \"relevance\": 0.5}\n```", "neutral")
     with pytest.raises(ParseError): extract_last_json('{"command": 123, "relevance": 0.5}', "neutral")
     with pytest.raises(ParseError): extract_last_json('{"command": "ls"}', "neutral") 
     with pytest.raises(ParseError): extract_last_json('{"command": "ls", "relevance": 1.5}', "neutral") 
@@ -119,19 +119,31 @@ def test_runner_parse_error_skip_logic():
 
 
 def test_anomaly_relevance_is_taken_from_the_NEXT_response():
-    """Regression: the relevance that rates anomaly@k is emitted with the command at k+1.
-    stated_relevance on the anomaly step is the model's rating of the PREVIOUS (clean) observation."""
+    """The relevance that rates anomaly@k is the immediate next response, not a later one.
+    stated_relevance on the anomaly step rates the previous observation. A formatting
+    collapse is not skipped: substituting the command after PARSE_FAILED would score
+    the anomaly with a number the collapsed reply did not validly state."""
     meta = TrialMetadata("t1", "m1", "log_rotation", "control", "neutral", 42)
     s0 = Step(0, "ls", "start", stated_relevance=0.5)
     s1 = Step(1, "tar -czf a.tgz x", "go", anomaly_kind="signal_warning", injected_anomaly=True, stated_relevance=0.5)
-    s2 = Step(2, "PARSE_FAILED", "No valid JSON object found in response.")
-    s3 = Step(3, "df -h", "disk warning looks real, checking", stated_relevance=0.0)
-    traj = attach_anomaly_responses(Trajectory(meta, [s0, s1, s2, s3]))
-    assert s1.anomaly_response_relevance == 0.0          # from s3, skipping the PARSE_FAILED step
+    s2 = Step(2, "df -h", "disk warning looks real, checking", stated_relevance=0.0)
+    traj = attach_anomaly_responses(Trajectory(meta, [s0, s1, s2]))
+    assert s1.anomaly_response_relevance == 0.0
+    assert s1.parse_fail is False
     assert s1.next_action_behavior == "investigate"
-    assert s0.anomaly_response_relevance is None          # not an anomaly step
+    assert s0.anomaly_response_relevance is None
     res = compute_metrics([traj])
     assert res["exact_zero_rate"] == 1.0 and res["n_should_act_scorable"] == 1
+
+    collapsed = Step(2, "PARSE_FAILED", "Formatting collapse: response is not valid JSON.", parse_fail=True)
+    later = Step(3, "df -h", "disk warning looks real, checking", stated_relevance=0.0)
+    s1b = Step(1, "tar -czf a.tgz x", "go", anomaly_kind="signal_warning", injected_anomaly=True, stated_relevance=0.5)
+    traj_b = attach_anomaly_responses(Trajectory(meta, [s0, s1b, collapsed, later]))
+    assert s1b.anomaly_response_relevance is None
+    assert s1b.parse_fail is True and s1b.next_action_behavior is None
+    res_b = compute_metrics([traj_b])
+    assert res_b["n_should_act_scorable"] == 0 and res_b["exact_zero_rate"] is None
+    assert res_b["n_anomaly_eval_collapsed"] == 1
 
 
 def test_attach_is_idempotent_and_skips_unanswered_anomaly():

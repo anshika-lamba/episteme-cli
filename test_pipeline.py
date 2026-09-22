@@ -30,18 +30,9 @@ from judge import parse_judge_json, render_prompt
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("text,expected_cmd,expected_rel", [
     ('{"command": "ls -la", "relevance": 0.25, "reasoning": "look"}', "ls -la", 0.25),
-    ('Sure! Here you go:\n```json\n{"command": "pwd", "relevance": 0, "reasoning": "x"}\n```\nDone.', "pwd", 0.0),
-    ('{"command": "cat a", "relevance": "0.5"}', "cat a", 0.5),                       # numeric string accepted
-    ('{"command": "ls", "relevance": 1, "reasoning": {"nested": "{brace}"}}', "ls", 1.0),
-    ('prefix {"command": "echo {}", "relevance": 0.1} trailing {not json}', "echo {}", 0.1),  # last span invalid -> fall back
-    ('{"command": "ls", "relevance": 0.5} {}', "ls", 0.5),                            # trailing empty object is not an answer
-    ('```json\n{"command": "df -h", "relevance": 0.0, "reasoning": "disk",}\n```', "df -h", 0.0),  # fence + trailing comma
-    ("{'command': 'ls', 'relevance': 0.4, 'reasoning': 'ok'}", "ls", 0.4),            # single-quoted object
-    ('{\u201ccommand\u201d: \u201cls\u201d, \u201crelevance\u201d: 0.2}', "ls", 0.2),  # smart quotes
-    ('{"command": "ls", "relevance": 0.3', "ls", 0.3),                                 # one missing closer
-    ('example {"command": "ls", "relevance": 0.9} final {"command": "df -h", "relevance": 0.0}', "df -h", 0.0),
-    ('[{"command": "ls", "relevance": 0.9}, {"command": "pwd", "relevance": 0.1}]', "pwd", 0.1),
-    ('{"command": "ls", "relevance": [0.0, 0.95, 1.0]}', "ls", 1.0),                  # array -> last in-range number
+    ('{"command": "ls", "relevance": 0, "reasoning": "x"}', "ls", 0.0),
+    ('{"command": "ls", "relevance": 1, "reasoning": "x"}', "ls", 1.0),
+    ('  {"command": "pwd", "relevance": 0.3}  ', "pwd", 0.3),  # json.loads allows surrounding whitespace; that is not salvage
 ])
 def test_extract_valid(text, expected_cmd, expected_rel):
     p = extract_last_json(text, "neutral")
@@ -49,15 +40,22 @@ def test_extract_valid(text, expected_cmd, expected_rel):
 
 
 @pytest.mark.parametrize("text,msg", [
-    ("no json here", "No valid JSON"),
-    ("[0.0, 0.95, 1.0]", "No valid JSON"),                          # a relevance array has no command; do not invent one
+    ("no json here", "Formatting collapse"),
+    ("```json\n{\"command\": \"pwd\", \"relevance\": 0}\n```", "Formatting collapse"),  # a fence is not valid JSON
+    ('{"command": "ls", "relevance": 0.5} {}', "Formatting collapse"),  # trailing empty object is not stripped
+    ('{"command": "df -h", "relevance": 0.0,}', "Formatting collapse"),  # trailing comma is not repaired
+    ("{'command': 'ls', 'relevance': 0.4}", "Formatting collapse"),
+    ('{"command": "ls", "relevance": 0.3', "Formatting collapse"),
+    ("[0.0, 0.95, 1.0]", "Formatting collapse"),  # a relevance array has no command; do not invent one
+    ('{"command": "ls", "relevance": [0.0, 0.95, 1.0]}', "between 0.0 and 1.0"),  # do not unwrap an array
+    ('{"command": "cat a", "relevance": "0.5"}', "between 0.0 and 1.0"),  # do not coerce a numeric string
     ('{"command": "", "relevance": 0.5}', "command"),
     ('{"command": "ls"}', "missing 'relevance'"),
     ('{"command": "ls", "relevance": null}', "missing 'relevance'"),
     ('{"command": "ls", "relevance": true}', "between 0.0 and 1.0"),
     ('{"command": "ls", "relevance": -0.1}', "between 0.0 and 1.0"),
     ('{"command": "ls", "relevance": "high"}', "between 0.0 and 1.0"),
-    ('{"command": "ls", "relevance": "95%"}', "between 0.0 and 1.0"),  # do not rescale a percent into 0.0
+    ('{"command": "ls", "relevance": "95%"}', "between 0.0 and 1.0"),
 ])
 def test_extract_invalid(text, msg):
     with pytest.raises(ParseError, match=msg):
@@ -68,11 +66,11 @@ def test_no_numeric_forces_none_even_if_model_supplies_relevance():
     assert extract_last_json('{"command": "ls", "relevance": 0.7}', "no_numeric")["relevance"] is None
 
 
-def test_array_relevance_is_flagged_and_missing_relevance_is_not_zero():
-    coerced = extract_last_json('{"command": "ls", "relevance": [0.0, "0.4"]}', "neutral")
-    assert coerced["relevance"] == 0.4 and coerced["_relevance_coerced"] == "array_last"
+def test_missing_relevance_is_not_imputed_as_zero():
     with pytest.raises(ParseError, match="missing 'relevance'"):
         extract_last_json('{"command": "ls", "relevance": null}', "original")
+    with pytest.raises(ParseError, match="Formatting collapse"):
+        extract_last_json('I will run ls.\n{"command": "ls", "relevance": 0.0}', "neutral")
 
 
 # --------------------------------------------------------------------------- #
@@ -324,6 +322,7 @@ def test_mock_pilot_end_to_end(tmp_path):
     assert len(lines) == 18 and all(l["metadata"]["schema_version"] == "2.2" for l in lines)
     r2 = subprocess.run([sys.executable, "run_grid.py", "--provider", "mock", "--pilot", "--out", str(out)], capture_output=True, text=True, env=env)
     assert "18 already done, 0 to run" in r2.stderr
+    assert len([l for l in out.read_text().splitlines() if l.strip()]) == 18  # resume appends; it does not rewrite
     r3 = subprocess.run([sys.executable, "stats.py", str(out), "--boot", "50", "--perms", "50"], capture_output=True, text=True, env=env)
     assert r3.returncode == 0 and "exact_zero_rate" in r3.stdout and "SCENARIO" in r3.stdout
 
@@ -483,7 +482,7 @@ def test_event_sink_taxonomy(monkeypatch, tmp_path):
     assert sink.events[-1]["kind"] == "http_4xx_fatal" and "trial_id" not in sink.events[-1]
     s = summarize_events(sink.events)
     assert s["by_kind"]["transport/http_429"] == 1 and s["by_http_status"]["404"] == 1
-    assert s["parse_failure_reasons"] == {"No valid JSON object found in response.": 1}
+    assert s["parse_failure_reasons"] == {"Formatting collapse: response is not valid JSON.": 1}
     sink.close({"ok": True})
     lines = [json.loads(l) for l in (tmp_path / "h.jsonl").read_text().splitlines()]
     assert lines[0]["kind"] == "run_start" and lines[-1]["kind"] == "run_end" and len(lines) == 2 + len(sink.events)

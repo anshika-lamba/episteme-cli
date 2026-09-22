@@ -12,12 +12,13 @@ Design
 * Grid = tasks x conditions x variants x seeds. Within a seed, cells are ordered
   round-robin over conditions, so a run killed half-way still leaves the
   conditions balanced (the primary comparison is control vs real_skill).
-* Every finished trajectory is appended, flushed and fsync'd (JSONL). Re-running
-  the same command skips trial_ids already present in --out (resume by default).
-  A trailing partial line from a reboot is truncated. Trials aborted by a quota
-  wall, a sandbox setup failure, or transport exhaustion ("gave up after") are
-  dropped and re-queued; a finished trial that merely logged a ProviderError
-  (e.g. HTTP 400) stays skipped.
+* Every finished trajectory is appended, flushed and fsync'd (JSONL). The file is
+  never truncated. Re-running the same command reads --out first and skips
+  trial_ids already logged, including trials whose only failure was a formatting
+  collapse (that is a measurement, not a crash). A trailing partial line from a
+  reboot is truncated. Trials aborted by a quota wall, a sandbox setup failure,
+  or transport exhaustion ("gave up after") are dropped and re-queued; a finished
+  trial that merely logged a permanent ProviderError (e.g. HTTP 400) stays skipped.
 * QuotaExceededError (daily/monthly cap) stops the run cleanly; the partial
   trajectory is still written with metadata.aborted_reason set.
 * Pilot = 2 tasks x 3 conditions x 3 variants x seed 0 = 18 trials, i.e. one of

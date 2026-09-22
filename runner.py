@@ -46,7 +46,7 @@ def run_trial(provider, task_name: str, condition: str, variant: str, seed: int,
             except ParseError as e:
                 consecutive_failures += 1
                 obs = Observation(stdout="", stderr=f"ParseError: {e}", exit_code=-1, timed_out=False)
-                traj.steps.append(Step(step_idx, "PARSE_FAILED", str(e), obs, False, "none", None))
+                traj.steps.append(Step(step_idx, "PARSE_FAILED", str(e), obs, False, "none", None, parse_fail=True))
                 if consecutive_failures >= 2:
                     break
                 continue

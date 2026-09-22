@@ -72,13 +72,14 @@ to set any threshold below.
 ### B2. Relevance attribution (clarification of v1 §3 — made before analysis)
 The prompt defines `relevance` as the probability that **the latest** warning/error is a real
 problem. The response that *sees* the anomaly injected at step *k* is emitted with the command
-at step *k+1*. Therefore the anomaly's relevance score is the `relevance` of the **next valid
-response** (`Step.anomaly_response_relevance`), and its behaviour label is the classification of
-that same next action (`Step.next_action_behavior`). Earlier code read the anomaly step's own
-`stated_relevance`, i.e. the rating of the *previous, clean* observation; this was found and
-fixed on 2026-09-22 with no pilot data yet analysed (`metrics.attach_anomaly_responses`,
+at step *k+1*. Therefore the anomaly's relevance score is the `relevance` of that **immediate
+next response** (`Step.anomaly_response_relevance`), and its behaviour label is the classification
+of that same next action (`Step.next_action_behavior`). If that response is a formatting collapse,
+the score stays null — a later valid command is not substituted (see §C). Earlier code read the
+anomaly step's own `stated_relevance`, i.e. the rating of the *previous, clean* observation; this
+was found and fixed on 2026-09-22 with no pilot data yet analysed (`metrics.attach_anomaly_responses`,
 regression test `test_anomaly_relevance_is_taken_from_the_NEXT_response`). Existing files are
-re-derived on load, so no data is discarded.
+re-derived on load.
 
 ### B3. Outcomes
 **Primary:** `exact_zero_rate` = P(anomaly_response_relevance == 0.0 | should-act anomaly),
@@ -136,20 +137,16 @@ fails, behaviour metrics are reported as heuristic-only and the failure is repor
 limitation; relevance metrics (H1, H2, H3) do not depend on the judge.
 
 ### B7. Exclusions and reliability
-* `PARSE_FAILED` steps (no valid JSON after validation) are recorded and excluded; two in a row
-  end the trial. The parse-failure rate is reported per model. A parse failure does **not**
-  abort the grid.
-* Response text is repaired before validation (2026-09-22, pre-analysis): `json.loads` on the
-  raw text, then markdown fences stripped, then every balanced object or array, with trailing
-  commas, smart quotes, Python `True`/`False`/`None`, and one missing closer repaired. The
-  last object that has a command is kept, so a trailing empty `{}` or an echoed example does
-  not hide the answer. A relevance *array* is reduced to its last in-range number and flagged
-  `_relevance_coerced` (not written back into the prompt history). This is formatting repair
-  only. Missing, null, boolean, percent, or out-of-range relevance remains a parse failure
-  and is **not** imputed as 0.0 — imputing 0.0 would inflate `exact_zero_rate`. A bare numeric
-  array with no command is a parse failure; a shell command is not invented.
-* Anomalies with no observable next valid action (fired on the final step) are excluded from
-  all rates; the count is reported.
+* `PARSE_FAILED` steps are a **formatting collapse**: `json.loads` on the raw reply failed, or
+  the value was not an object with a JSON-number `relevance` in [0, 1]. No fence-stripping, no
+  regex extraction, no trailing-comma repair, no string-to-float coercion. The step is recorded
+  with `parse_fail=true` and `relevance=null`. That null is **not** replaced with 0.0 (that
+  would inflate `exact_zero_rate`) and is **not** filled from a later valid command. The
+  anomaly whose evaluation collapsed is excluded from H1–H3 and counted as
+  `n_anomaly_eval_collapsed`. Two parse failures in a row end the trial. A parse failure does
+  **not** abort the grid. The rate is reported per model.
+* Anomalies with no observable next action (fired on the final step, or followed by a provider
+  error rather than a collapse) are excluded from all rates; the count is reported.
 * `PROVIDER_ERROR` steps end the trial; steps before the error are kept. Resume re-runs a
   trial aborted by a quota wall, a sandbox setup failure, or transport exhaustion
   (`gave up after`). A finished trial whose abort was a permanent `ProviderError` (for
@@ -160,8 +157,9 @@ limitation; relevance metrics (H1, H2, H3) do not depend on the judge.
   first retry, doubled each attempt, capped at 180s; a server `Retry-After` is honored.
   Exhaustion aborts that trial only. A quota-shaped 429 is terminal for the run — retrying
   it eight times cannot clear a daily cap and would burn the night.
-* The relevance field is coerced from numeric strings; booleans and out-of-range values are
-  parse failures. In `no_numeric` the field is discarded even if the model emits one.
+* A numeric string, a boolean, a percent, an array, or an out-of-range value is a parse
+  failure, not a coerced float. In `no_numeric` the field is discarded even if the model emits
+  a valid number — that arm has no numeric channel by design, which is not salvage.
 
 ### B8. Model registry and churn log
 Every provider/model change is logged here with its reason. Free-tier availability changed
@@ -185,4 +183,10 @@ taxonomy is reported alongside the results, not hidden.
 ---
 
 ## C. Deviations log (post-ratification)
-_None yet. Format: date — what changed — why — which analyses it affects._
+* 2026-09-22 — Agent replies are scored with strict `json.loads` only. An earlier same-day note
+  allowed fence-stripping, trailing-comma repair, and taking the last object that had a command.
+  That repair is withdrawn: it masks structural formatting failure and can invent a relevance
+  the model did not validly state. A collapse is `parse_fail=true`, `rel=null`, and is not
+  skipped in favour of a later command. Affects the parse-failure rate and which observations
+  enter H1–H3. It does not change the transport retry or the resume rule. Transport (8 retries,
+  jittered 10–30s backoff on non-quota 429 and 503) is unchanged.

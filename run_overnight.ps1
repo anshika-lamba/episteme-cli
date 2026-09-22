@@ -16,9 +16,12 @@
   -Seven -TrialsEach 1000 -AllowOverBudget, and Cohere only with -IncludeCohere
   as well. The script prints the quota warning before the first call.
 
-  Re-run the same command after a reboot, a quota wall, or a crash. Finished
-  trial_ids are skipped. Trials that died on a quota wall or on transport
-  exhaustion ("gave up after") are re-queued. A torn last line is truncated.
+  Re-run the same command after a reboot, a quota wall, or a crash. run_grid.py
+  reads the existing .jsonl first, appends only missing cells, and does not
+  overwrite finished trials. A formatting collapse is a finished measurement
+  (parse_fail, rel=null) and is not re-run. Trials that died on a quota wall or
+  on transport exhaustion ("gave up after") are re-queued. A torn last line is
+  truncated.
 
 .EXAMPLE
   .\run_overnight.ps1

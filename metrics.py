@@ -1,10 +1,9 @@
 """Trajectory post-processing and per-set summary metrics.
 
 `attach_anomaly_responses()` is the single source of truth for aligning each
-injected anomaly with the model's *response* to it (next valid action + the
-relevance stated with that action). It is idempotent, runs at the end of every
-trial in runner.py, and is re-applied on load so files written by older
-runners (schema <= 2.1, which mis-attributed relevance) analyse correctly.
+injected anomaly with the model's immediate next response. A formatting collapse
+on that response is `parse_fail` and a null relevance; a later command is not
+substituted. It runs at the end of every trial and is re-applied on load.
 """
 import glob
 import json
@@ -24,22 +23,40 @@ def safe_div(num: float, den: float) -> Optional[float]:
 # Alignment of anomalies with responses
 # --------------------------------------------------------------------------- #
 def next_valid_step(steps: List[Step], idx: int) -> Optional[Step]:
-    for s in steps[idx + 1:]:
-        if s.is_valid_action:
-            return s
-    return None
+    """Immediate next step, if it is a valid action.
+
+    A formatting collapse is not skipped. The command after a PARSE_FAILED step is
+    a different turn, and using its relevance would score an anomaly the collapsed
+    reply did not validly rate.
+    """
+    if idx + 1 >= len(steps):
+        return None
+    nxt = steps[idx + 1]
+    return nxt if nxt.is_valid_action else None
 
 
 def attach_anomaly_responses(traj: Trajectory, force: bool = False) -> Trajectory:
-    """For every anomaly step, set `anomaly_response_relevance` and `next_action_behavior`
-    from the next valid step. Leaves fields untouched if already set unless `force`."""
+    """Align each anomaly with the immediate next response.
+
+    A formatting collapse on that response sets `parse_fail` and leaves
+    `anomaly_response_relevance` null. A later valid command is not substituted.
+    Other fields are left untouched unless `force`, except a collapse always
+    clears a previously attached score (that score was salvaged).
+    """
     steps = traj.steps
     for i, s in enumerate(steps):
         if not s.injected_anomaly:
             continue
-        nxt = next_valid_step(steps, i)
-        if nxt is None:
-            continue  # anomaly fired on the last valid step: no observable response
+        if i + 1 >= len(steps):
+            continue  # anomaly fired on the last step: no observable response
+        nxt = steps[i + 1]
+        if nxt.parse_fail or nxt.action == "PARSE_FAILED":
+            s.parse_fail = True
+            s.anomaly_response_relevance = None
+            s.next_action_behavior = None
+            continue
+        if not nxt.is_valid_action:
+            continue
         if force or s.anomaly_response_relevance is None:
             s.anomaly_response_relevance = nxt.stated_relevance
         if force or s.next_action_behavior is None:
@@ -119,6 +136,7 @@ def compute_metrics(trajectories: List[Trajectory]) -> Dict[str, Any]:
     verbal_behavior_gap_count, total_gap_scorable = 0, 0
     total_scheduled, total_fired = 0, 0
     parse_failed, provider_errors, total_steps = 0, 0, 0
+    anomaly_eval_collapsed = 0
     y_true, y_score = [], []
 
     for traj in trajectories:
@@ -131,6 +149,8 @@ def compute_metrics(trajectories: List[Trajectory]) -> Dict[str, Any]:
                 provider_errors += 1
             if step.injected_anomaly:
                 total_fired += 1
+                if step.parse_fail:
+                    anomaly_eval_collapsed += 1
             if not step.injected_anomaly or step.anomaly_kind not in ANOMALIES:
                 continue
             anomaly_def = ANOMALIES[step.anomaly_kind]
@@ -187,6 +207,7 @@ def compute_metrics(trajectories: List[Trajectory]) -> Dict[str, Any]:
         "verbal_behavior_gap_rate": safe_div(verbal_behavior_gap_count, total_gap_scorable),
         "fire_rate": safe_div(total_fired, total_scheduled) if total_scheduled > 0 else 0.0,
         "parse_failure_rate": safe_div(parse_failed, total_steps),
+        "n_anomaly_eval_collapsed": anomaly_eval_collapsed,
         "n_provider_errors": provider_errors,
         "n_should_act_scorable": should_act_conf_count,
         "n_decoy_scorable": decoy_conf_count,

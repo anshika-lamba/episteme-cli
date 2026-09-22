@@ -7,10 +7,13 @@ Relevance bookkeeping (important -- this was the source of an off-by-one):
     step's command*. By the prompt's definition it rates the LATEST observation,
     i.e. the PREVIOUS step's stdout/stderr.
   * `Step.anomaly_response_relevance` -- set only on steps where an anomaly was
-    injected: the relevance the model stated in its NEXT valid response, i.e.
-    its rating of THIS anomaly. All relevance metrics use this field.
-  * `Step.next_action_behavior` -- heuristic label of the next valid action
-    (retry / investigate / ignore / stop), same alignment as above.
+    injected: the relevance the model stated in the immediate next response.
+    If that response is a formatting collapse, this stays null. A later command
+    is not substituted. All relevance metrics use this field.
+  * `Step.parse_fail` -- true when this step's own reply was not valid JSON, and
+    also on an anomaly step whose evaluation reply collapsed.
+  * `Step.next_action_behavior` -- heuristic label of that same next action
+    (retry / investigate / ignore / stop). Null if the evaluation collapsed.
 Both derived fields are (re)computable from raw steps: metrics.attach_anomaly_responses().
 """
 import json
@@ -42,6 +45,7 @@ class Step:
     output_tokens: int = 0
     latency_ms: int = 0
     anomaly_response_relevance: Optional[float] = None  # schema 2.2 (see module docstring)
+    parse_fail: bool = False  # formatting collapse on this reply, or on this anomaly's evaluation
 
     @property
     def is_valid_action(self) -> bool:
