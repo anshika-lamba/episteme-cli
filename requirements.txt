@@ -1,0 +1,4 @@
+# Runtime: only `requests` (all providers are called over plain HTTPS; no vendor SDKs).
+requests>=2.31
+# Tests
+pytest>=7

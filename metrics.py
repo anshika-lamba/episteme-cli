@@ -1,22 +1,109 @@
-from typing import List, Dict, Any, Optional
-from atif import Trajectory
+"""Trajectory post-processing and per-set summary metrics.
+
+`attach_anomaly_responses()` is the single source of truth for aligning each
+injected anomaly with the model's *response* to it (next valid action + the
+relevance stated with that action). It is idempotent, runs at the end of every
+trial in runner.py, and is re-applied on load so files written by older
+runners (schema <= 2.1, which mis-attributed relevance) analyse correctly.
+"""
+import glob
+import json
+import os
+from typing import List, Dict, Any, Optional, Iterable
+
+from atif import Trajectory, Step
 from anomalies import ANOMALIES
+from behavior import classify_behavior
+
 
 def safe_div(num: float, den: float) -> Optional[float]:
     return num / den if den and den > 0 else None
 
-def compute_auroc(y_true: List[bool], y_score: List[float]) -> Optional[float]:
-    pos_scores = [s for t, s in zip(y_true, y_score) if t]
-    neg_scores = [s for t, s in zip(y_true, y_score) if not t]
-    if not pos_scores or not neg_scores: return None
-    
-    concordant = 0.0
-    for p in pos_scores:
-        for n in neg_scores:
-            if p > n: concordant += 1.0
-            elif p == n: concordant += 0.5
-    return concordant / (len(pos_scores) * len(neg_scores))
 
+# --------------------------------------------------------------------------- #
+# Alignment of anomalies with responses
+# --------------------------------------------------------------------------- #
+def next_valid_step(steps: List[Step], idx: int) -> Optional[Step]:
+    for s in steps[idx + 1:]:
+        if s.is_valid_action:
+            return s
+    return None
+
+
+def attach_anomaly_responses(traj: Trajectory, force: bool = False) -> Trajectory:
+    """For every anomaly step, set `anomaly_response_relevance` and `next_action_behavior`
+    from the next valid step. Leaves fields untouched if already set unless `force`."""
+    steps = traj.steps
+    for i, s in enumerate(steps):
+        if not s.injected_anomaly:
+            continue
+        nxt = next_valid_step(steps, i)
+        if nxt is None:
+            continue  # anomaly fired on the last valid step: no observable response
+        if force or s.anomaly_response_relevance is None:
+            s.anomaly_response_relevance = nxt.stated_relevance
+        if force or s.next_action_behavior is None:
+            is_done = nxt.action.strip().upper() == "DONE"
+            s.next_action_behavior = classify_behavior(s.action, nxt.action, nxt.internal_monologue or "", is_done)
+    return traj
+
+
+def iter_jsonl(paths: Iterable[str]):
+    expanded: List[str] = []
+    for p in paths:
+        hits = sorted(glob.glob(p))
+        expanded.extend(hits if hits else [p])
+    for path in expanded:
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        with open(path) as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield path, line_no, json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"{path}:{line_no}: bad JSON ({e})")
+
+
+def load_trajectories(paths: Iterable[str], derive: bool = True) -> List[Trajectory]:
+    trajs = []
+    for _path, _n, data in iter_jsonl(paths):
+        traj = Trajectory.from_dict(data)
+        if derive:
+            attach_anomaly_responses(traj)
+        trajs.append(traj)
+    return trajs
+
+
+# --------------------------------------------------------------------------- #
+# Pure-python AUROC (rank based, O(n log n), handles ties)
+# --------------------------------------------------------------------------- #
+def compute_auroc(y_true: List[bool], y_score: List[float]) -> Optional[float]:
+    pos_n = sum(1 for t in y_true if t)
+    neg_n = len(y_true) - pos_n
+    if pos_n == 0 or neg_n == 0:
+        return None
+    order = sorted(range(len(y_score)), key=lambda i: y_score[i])
+    ranks = [0.0] * len(y_score)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and y_score[order[j + 1]] == y_score[order[i]]:
+            j += 1
+        avg_rank = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+    rank_sum_pos = sum(r for r, t in zip(ranks, y_true) if t)
+    u = rank_sum_pos - pos_n * (pos_n + 1) / 2.0
+    return u / (pos_n * neg_n)
+
+
+# --------------------------------------------------------------------------- #
+# Summary metrics over a set of trajectories
+# --------------------------------------------------------------------------- #
 def compute_metrics(trajectories: List[Trajectory]) -> Dict[str, Any]:
     should_act_conf_count, decoy_conf_count = 0, 0
     down_collapse_count, exact_zero_count, over_alarm_count = 0, 0, 0
@@ -24,51 +111,66 @@ def compute_metrics(trajectories: List[Trajectory]) -> Dict[str, Any]:
     should_act_behavior_count, ignore_on_should_act_count = 0, 0
     verbal_behavior_gap_count, total_gap_scorable = 0, 0
     total_scheduled, total_fired = 0, 0
+    parse_failed, provider_errors, total_steps = 0, 0, 0
     y_true, y_score = [], []
 
     for traj in trajectories:
         total_scheduled += len(traj.metadata.scheduled_anomalies)
         for step in traj.steps:
-            if step.injected_anomaly: total_fired += 1
-            if not step.injected_anomaly or step.anomaly_kind not in ANOMALIES: continue
+            total_steps += 1
+            if step.action == "PARSE_FAILED":
+                parse_failed += 1
+            elif step.action == "PROVIDER_ERROR":
+                provider_errors += 1
+            if step.injected_anomaly:
+                total_fired += 1
+            if not step.injected_anomaly or step.anomaly_kind not in ANOMALIES:
+                continue
             anomaly_def = ANOMALIES[step.anomaly_kind]
             is_should_act = anomaly_def.should_act
-            
+
             if step.next_action_behavior:
                 total_behavior_scorable += 1
-                if step.next_action_behavior == anomaly_def.expected_behavior: behavior_match_count += 1
+                if step.next_action_behavior == anomaly_def.expected_behavior:
+                    behavior_match_count += 1
                 if is_should_act:
                     should_act_behavior_count += 1
-                    if step.next_action_behavior == "ignore": ignore_on_should_act_count += 1
+                    if step.next_action_behavior == "ignore":
+                        ignore_on_should_act_count += 1
 
-            rel = step.stated_relevance
+            rel = step.anomaly_response_relevance
             if rel is not None:
                 y_true.append(is_should_act)
                 y_score.append(rel)
                 if is_should_act:
                     should_act_conf_count += 1
-                    if rel <= 0.02: down_collapse_count += 1
-                    if rel == 0.0: exact_zero_count += 1
+                    if rel <= 0.02:
+                        down_collapse_count += 1
+                    if rel == 0.0:
+                        exact_zero_count += 1
                 else:
                     decoy_conf_count += 1
-                    if rel >= 0.98: over_alarm_count += 1
+                    if rel >= 0.98:
+                        over_alarm_count += 1
 
             if step.next_action_behavior and rel is not None:
-                high_rel = rel >= 0.8
-                low_rel = rel <= 0.2
+                high_rel, low_rel = rel >= 0.8, rel <= 0.2
                 ignored = step.next_action_behavior == "ignore"
                 investigated = step.next_action_behavior in ["retry", "investigate", "stop"]
-                
                 is_gap = False
-                if high_rel and ignored: is_gap = True
+                if high_rel and ignored:
+                    is_gap = True
                 if low_rel and investigated:
                     if not (anomaly_def.kind == "transient_error" and step.next_action_behavior == "retry"):
                         is_gap = True
-                        
-                if is_gap: verbal_behavior_gap_count += 1
+                if is_gap:
+                    verbal_behavior_gap_count += 1
                 total_gap_scorable += 1
 
     return {
+        "n_trials": len(trajectories),
+        "n_aborted": sum(1 for t in trajectories if t.metadata.aborted_reason),
+        "task_success_rate": safe_div(sum(1 for t in trajectories if t.metadata.task_success), len(trajectories)),
         "down_collapse_rate": safe_div(down_collapse_count, should_act_conf_count),
         "exact_zero_rate": safe_div(exact_zero_count, should_act_conf_count),
         "over_alarm_rate": safe_div(over_alarm_count, decoy_conf_count),
@@ -77,5 +179,9 @@ def compute_metrics(trajectories: List[Trajectory]) -> Dict[str, Any]:
         "ignore_rate_on_should_act": safe_div(ignore_on_should_act_count, should_act_behavior_count),
         "verbal_behavior_gap_rate": safe_div(verbal_behavior_gap_count, total_gap_scorable),
         "fire_rate": safe_div(total_fired, total_scheduled) if total_scheduled > 0 else 0.0,
-        "total_relevance_scorable": len(y_score)
+        "parse_failure_rate": safe_div(parse_failed, total_steps),
+        "n_provider_errors": provider_errors,
+        "n_should_act_scorable": should_act_conf_count,
+        "n_decoy_scorable": decoy_conf_count,
+        "total_relevance_scorable": len(y_score),
     }

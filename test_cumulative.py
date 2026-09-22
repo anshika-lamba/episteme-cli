@@ -9,7 +9,7 @@ from unittest.mock import patch
 from atif import Observation, Step, TrialMetadata, Trajectory
 from anomalies import ANOMALIES, inject_anomaly
 from schedule import generate_schedule
-from metrics import compute_auroc, compute_metrics
+from metrics import compute_auroc, compute_metrics, attach_anomaly_responses
 from providers import extract_last_json, ParseError, RateLimiter, ProviderError
 from tasks import scrub_secrets, TaskEnv, TASKS
 from mock_provider import MockProvider
@@ -34,19 +34,19 @@ def test_payload_routing_by_first_token():
 
 def test_gap_rate_denominator():
     meta = TrialMetadata("t1", "m1", "t1", "c1", "c1", 42)
-    s1 = Step(1, "x", anomaly_kind="decoy_warning", injected_anomaly=True, stated_relevance=0.1, next_action_behavior=None)
-    s2 = Step(2, "x", anomaly_kind="transient_error", injected_anomaly=True, stated_relevance=0.9, next_action_behavior="ignore")
+    s1 = Step(1, "x", anomaly_kind="decoy_warning", injected_anomaly=True, anomaly_response_relevance=0.1, next_action_behavior=None)
+    s2 = Step(2, "x", anomaly_kind="transient_error", injected_anomaly=True, anomaly_response_relevance=0.9, next_action_behavior="ignore")
     res = compute_metrics([Trajectory(meta, [s1, s2])])
     assert res["verbal_behavior_gap_rate"] == 1.0 
 
 def test_transient_retry_is_not_a_gap():
     meta = TrialMetadata("t1", "m1", "t1", "c1", "c1", 42)
-    s1 = Step(1, "x", anomaly_kind="transient_error", injected_anomaly=True, stated_relevance=0.0, next_action_behavior="retry")
+    s1 = Step(1, "x", anomaly_kind="transient_error", injected_anomaly=True, anomaly_response_relevance=0.0, next_action_behavior="retry")
     assert compute_metrics([Trajectory(meta, [s1])])["verbal_behavior_gap_rate"] == 0.0
 
 def test_rates_return_none_on_zero_denominator():
     meta = TrialMetadata("t1", "m1", "t1", "c1", "c1", 42)
-    s1 = Step(1, "x", anomaly_kind="decoy_warning", injected_anomaly=True, stated_relevance=0.5)
+    s1 = Step(1, "x", anomaly_kind="decoy_warning", injected_anomaly=True, anomaly_response_relevance=0.5)
     res = compute_metrics([Trajectory(meta, [s1])])
     assert res["down_collapse_rate"] is None
     
@@ -115,3 +115,47 @@ def test_runner_parse_error_skip_logic():
     assert traj.steps[0].action == "PARSE_FAILED"
     assert traj.steps[0].stated_relevance is None
     assert traj.steps[1].action == "retry_command"
+
+
+def test_anomaly_relevance_is_taken_from_the_NEXT_response():
+    """Regression: the relevance that rates anomaly@k is emitted with the command at k+1.
+    stated_relevance on the anomaly step is the model's rating of the PREVIOUS (clean) observation."""
+    meta = TrialMetadata("t1", "m1", "log_rotation", "control", "neutral", 42)
+    s0 = Step(0, "ls", "start", stated_relevance=0.5)
+    s1 = Step(1, "tar -czf a.tgz x", "go", anomaly_kind="signal_warning", injected_anomaly=True, stated_relevance=0.5)
+    s2 = Step(2, "PARSE_FAILED", "No valid JSON object found in response.")
+    s3 = Step(3, "df -h", "disk warning looks real, checking", stated_relevance=0.0)
+    traj = attach_anomaly_responses(Trajectory(meta, [s0, s1, s2, s3]))
+    assert s1.anomaly_response_relevance == 0.0          # from s3, skipping the PARSE_FAILED step
+    assert s1.next_action_behavior == "investigate"
+    assert s0.anomaly_response_relevance is None          # not an anomaly step
+    res = compute_metrics([traj])
+    assert res["exact_zero_rate"] == 1.0 and res["n_should_act_scorable"] == 1
+
+
+def test_attach_is_idempotent_and_skips_unanswered_anomaly():
+    meta = TrialMetadata("t1", "m1", "log_rotation", "control", "neutral", 42)
+    s0 = Step(0, "ls", "", anomaly_kind="blocking_error", injected_anomaly=True, stated_relevance=0.1)
+    traj = attach_anomaly_responses(Trajectory(meta, [s0]))
+    assert s0.anomaly_response_relevance is None and s0.next_action_behavior is None
+    s1 = Step(1, "DONE", "fatal, stopping", stated_relevance=0.9)
+    traj.steps.append(s1)
+    attach_anomaly_responses(traj)
+    assert s0.anomaly_response_relevance == 0.9 and s0.next_action_behavior == "stop"
+    s1.stated_relevance = 0.1
+    attach_anomaly_responses(traj)                        # already set -> untouched
+    assert s0.anomaly_response_relevance == 0.9
+    attach_anomaly_responses(traj, force=True)
+    assert s0.anomaly_response_relevance == 0.1
+
+
+def test_schema_roundtrip_tolerates_old_and_unknown_fields():
+    old = {"metadata": {"trial_id": "x", "agent_version": "m", "task_name": "log_rotation", "condition": "control",
+                        "prompt_variant": "neutral", "seed": 1, "scheduled_anomalies": {"1": "decoy_warning"}, "schema_version": "2.1"},
+           "steps": [{"step_index": 0, "action": "ls", "observation": {"stdout": "", "stderr": "", "exit_code": 0, "timed_out": False},
+                      "injected_anomaly": True, "anomaly_kind": "decoy_warning", "stated_relevance": 0.2, "future_field": 1}]}
+    traj = Trajectory.from_dict(old)
+    assert traj.metadata.scheduled_anomalies == {1: "decoy_warning"} and traj.metadata.provider_name == ""
+    assert traj.steps[0].anomaly_response_relevance is None
+    again = Trajectory.from_dict(json.loads(traj.to_json()))
+    assert again.metadata.schema_version == "2.1" and again.steps[0].stated_relevance == 0.2

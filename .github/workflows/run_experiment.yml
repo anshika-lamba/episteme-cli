@@ -1,27 +1,73 @@
-name: AAAI-UC Experiment Runner
-on: workflow_dispatch
+name: Experiment grid
+# Manual runs of run_grid.py per provider. Free-tier daily caps mean one job rarely finishes a
+# full grid: the results artifact from a previous run can be downloaded, committed to
+# results/, and the next run resumes (run_grid.py skips trial_ids already in --out).
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "groq | gemini | mistral | cohere | mock"
+        required: true
+        default: "mock"
+      model:
+        description: "override registry default model (optional)"
+        required: false
+        default: ""
+      seeds:
+        description: "number of seeds (ignored with pilot=true)"
+        required: false
+        default: "1"
+      pilot:
+        description: "18-trial pilot"
+        required: false
+        default: "false"
+      subset:
+        description: "full | priority"
+        required: false
+        default: "full"
+      extra:
+        description: "extra run_grid.py flags, e.g. --max-calls 900"
+        required: false
+        default: ""
+
 jobs:
-  run-trials:
+  tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        model: [gemini-1.5-flash, llama3-8b-8192]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
-      - run: pip install google-generativeai groq requests pytest
-      - name: Run experiment
-        run: python run_experiment.py --model ${{ matrix.model }} --rpm 15 --tpm 10000 --rpd 1000 --out ${{ matrix.model }}_results.jsonl
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  grid:
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -r requirements.txt
+      - name: Run grid (resumes from any results/ already committed)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      - name: Upload Artifact
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+        run: |
+          set -x
+          ARGS="--provider ${{ inputs.provider }} --subset ${{ inputs.subset }} --seeds ${{ inputs.seeds }}"
+          if [ -n "${{ inputs.model }}" ]; then ARGS="$ARGS --model ${{ inputs.model }}"; fi
+          if [ "${{ inputs.pilot }}" = "true" ]; then ARGS="$ARGS --pilot"; fi
+          python run_grid.py $ARGS ${{ inputs.extra }} || true   # exit 3 = stopped at a quota wall; still upload
+          ls -la results/
+      - name: Quick stats
+        run: for f in results/*.jsonl; do echo "== $f"; python stats.py "$f" --boot 200 --no-perm || true; done
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results-${{ matrix.model }}-${{ github.run_id }}
-          path: ${{ matrix.model }}_results.jsonl
-          retention-days: 14
+          name: results-${{ inputs.provider }}-${{ github.run_id }}
+          path: results/*.jsonl
+          retention-days: 30

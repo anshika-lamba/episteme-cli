@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Run the experiment grid for one provider/model, resumably.
+
+    python run_grid.py --provider groq --pilot                 # 18-trial pilot -> results/pilot_groq.jsonl
+    python run_grid.py --provider gemini --seeds 7             # full grid: 36 cells x 7 seeds = 252 trials
+    python run_grid.py --provider cohere --subset priority --seeds 8   # 16 cells x 8 = 128 trials (~900 calls)
+    python run_grid.py --provider mistral --seeds 7 --dry-run  # print the plan + call budget, no API calls
+    python run_grid.py --provider groq --list-models           # what does this key actually see today?
+
+Design
+------
+* Grid = tasks x conditions x variants x seeds. Within a seed, cells are ordered
+  round-robin over conditions, so a run killed half-way still leaves the
+  conditions balanced (the primary comparison is control vs real_skill).
+* Every finished trajectory is appended + flushed immediately (JSONL). Re-running
+  the same command skips trial_ids already present in --out (resume by default).
+* QuotaExceededError (daily/monthly cap) stops the run cleanly; the partial
+  trajectory is still written with metadata.aborted_reason set.
+* Pilot = 2 tasks x 3 conditions x 3 variants x seed 0 = 18 trials, i.e. one of
+  every prompt cell -- enough to sanity-check every prompt/provider combination.
+"""
+import argparse
+import datetime as _dt
+import itertools
+import json
+import os
+import random
+import sys
+import time
+from typing import Dict, List, Set, Tuple
+
+from providers import make_provider, list_models, ProviderError, QuotaExceededError, REGISTRY
+from tasks import TASKS
+from runner import run_trial
+
+ALL_TASKS = list(TASKS.keys())                       # python_test, config_health, checksum_build, log_rotation
+ALL_CONDITIONS = ["control", "real_skill", "placebo_skill"]
+ALL_VARIANTS = ["original", "neutral", "no_numeric"]
+PILOT_TASKS = ["python_test", "log_rotation"]
+# Priority subset for capped providers (Cohere 1000/month): keeps the primary contrast
+# (control vs real_skill) and both numeric variants across all tasks.
+PRIORITY = dict(tasks=ALL_TASKS, conditions=["control", "real_skill"], variants=["original", "neutral"])
+CALLS_PER_TRIAL_EST = 8  # planning figure: <= max_steps (10); typical 5-8
+
+
+def build_plan(tasks: List[str], conditions: List[str], variants: List[str], seeds: List[int]) -> List[Tuple[str, str, str, int]]:
+    plan = []
+    for seed in seeds:
+        by_cond: Dict[str, List[Tuple[str, str]]] = {}
+        for task, variant in itertools.product(tasks, variants):
+            for cond in conditions:
+                by_cond.setdefault(cond, []).append((task, variant))
+        rng = random.Random(f"order|{seed}")
+        for cond in conditions:
+            rng.shuffle(by_cond[cond])
+        for i in range(len(tasks) * len(variants)):
+            for cond in conditions:
+                task, variant = by_cond[cond][i]
+                plan.append((task, cond, variant, seed))
+    return plan
+
+
+def existing_trial_ids(path: str) -> Tuple[Set[str], Set[str]]:
+    ids, models = set(), set()
+    if not os.path.exists(path):
+        return ids, models
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                meta = json.loads(line).get("metadata", {})
+            except json.JSONDecodeError:
+                continue
+            if (meta.get("aborted_reason") or "").startswith("QuotaExceeded"):
+                continue  # re-run trials that died on a quota wall
+            ids.add(meta.get("trial_id", ""))
+            models.add(meta.get("agent_version", ""))
+    return ids, models
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--provider", required=True, choices=list(REGISTRY) + ["mock"])
+    ap.add_argument("--model", default=None, help="override the registry default model for this provider")
+    ap.add_argument("--out", default=None, help="results JSONL (default results/<pilot_|>{provider}[_{model}].jsonl)")
+    ap.add_argument("--pilot", action="store_true", help="18-trial pilot: 2 tasks x 3 conditions x 3 variants x seed 0")
+    ap.add_argument("--subset", choices=["full", "priority"], default="full")
+    ap.add_argument("--seeds", type=int, default=1, help="number of seeds (grid replicates)")
+    ap.add_argument("--seed-start", type=int, default=0)
+    ap.add_argument("--tasks", nargs="+", default=None, choices=ALL_TASKS)
+    ap.add_argument("--conditions", nargs="+", default=None, choices=ALL_CONDITIONS)
+    ap.add_argument("--variants", nargs="+", default=None, choices=ALL_VARIANTS)
+    ap.add_argument("--max-steps", type=int, default=10)
+    ap.add_argument("--expected-steps", type=int, default=6, help="anomaly schedule horizon (do not change mid-experiment)")
+    ap.add_argument("--rpm", type=int, default=None)
+    ap.add_argument("--tpm", type=int, default=None)
+    ap.add_argument("--rpd", type=int, default=None)
+    ap.add_argument("--min-interval", type=float, default=None, help="seconds between calls (Mistral ~1.1)")
+    ap.add_argument("--monthly-cap", type=int, default=None, help="persistent per-month call cap (.quota/)")
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--max-output-tokens", type=int, default=400)
+    ap.add_argument("--json-mode", action="store_true", help="ask the API for JSON-mode output (asymmetric across providers; off by default)")
+    ap.add_argument("--max-trials", type=int, default=None, help="stop after this many NEW trials this run")
+    ap.add_argument("--max-calls", type=int, default=None, help="stop once this many API calls were made this run")
+    ap.add_argument("--sleep-between", type=float, default=0.0, help="extra pause between trials")
+    ap.add_argument("--no-resume", action="store_true", help="do not skip trial_ids already in --out")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--list-models", action="store_true")
+    ap.add_argument("--mock-seed", type=int, default=0)
+    args = ap.parse_args()
+
+    if args.list_models:
+        for m in list_models(args.provider):
+            print(m)
+        return 0
+
+    if args.pilot:
+        tasks, conditions, variants, seeds = PILOT_TASKS, ALL_CONDITIONS, ALL_VARIANTS, [args.seed_start]
+    elif args.subset == "priority":
+        tasks, conditions, variants = PRIORITY["tasks"], PRIORITY["conditions"], PRIORITY["variants"]
+        seeds = list(range(args.seed_start, args.seed_start + args.seeds))
+    else:
+        tasks, conditions, variants = ALL_TASKS, ALL_CONDITIONS, ALL_VARIANTS
+        seeds = list(range(args.seed_start, args.seed_start + args.seeds))
+    tasks = args.tasks or tasks
+    conditions = args.conditions or conditions
+    variants = args.variants or variants
+    plan = build_plan(tasks, conditions, variants, seeds)
+
+    model_tag = (args.model or (REGISTRY[args.provider]["cls"].default_model if args.provider in REGISTRY else "mock-model"))
+    safe_model = model_tag.replace("/", "-").replace(":", "-")
+    out = args.out or os.path.join("results", f"{'pilot_' if args.pilot else ''}{args.provider}_{safe_model}.jsonl")
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+
+    done_ids, done_models = (set(), set()) if args.no_resume else existing_trial_ids(out)
+    if done_models and any(m and m != model_tag for m in done_models):
+        print(f"[warn] {out} already contains other models: {sorted(done_models)} (use --out to separate them)", file=sys.stderr)
+    todo = [p for p in plan if f"{p[0]}_{p[1]}_{p[2]}_{p[3]}" not in done_ids]
+    if args.max_trials is not None:
+        todo = todo[: args.max_trials]
+
+    print(f"provider={args.provider} model={model_tag} out={out}", file=sys.stderr)
+    print(f"grid: {len(tasks)} tasks x {len(conditions)} conditions x {len(variants)} variants x {len(seeds)} seeds = {len(plan)} trials; "
+          f"{len(plan) - len(todo)} already done, {len(todo)} to run (~{len(todo) * CALLS_PER_TRIAL_EST} calls at {CALLS_PER_TRIAL_EST}/trial)", file=sys.stderr)
+    if args.provider in REGISTRY:
+        spec = REGISTRY[args.provider]
+        rpm = args.rpm or spec["rpm"]
+        rpd = args.rpd or spec["rpd"]
+        est_calls = len(todo) * CALLS_PER_TRIAL_EST
+        print(f"limits: rpm={rpm} tpm={args.tpm or spec['tpm']} rpd={rpd} min_interval={args.min_interval or spec['min_interval_s']}s "
+              f"monthly_cap={args.monthly_cap or spec.get('monthly_cap')} | {spec['notes']}", file=sys.stderr)
+        print(f"budget: >= {est_calls / rpm:.0f} min at the RPM ceiling; >= {est_calls / rpd:.1f} days at the RPD cap", file=sys.stderr)
+    if args.dry_run:
+        for i, (task, cond, var, seed) in enumerate(todo[:12]):
+            print(f"  {i:3d} {task:15s} {cond:14s} {var:10s} seed={seed}")
+        if len(todo) > 12:
+            print(f"  ... {len(todo) - 12} more")
+        return 0
+    if not todo:
+        print("nothing to do", file=sys.stderr)
+        return 0
+
+    overrides = dict(rpm=args.rpm, tpm=args.tpm, rpd=args.rpd, min_interval_s=args.min_interval, monthly_cap=args.monthly_cap,
+                     temperature=args.temperature, max_output_tokens=args.max_output_tokens, json_mode=args.json_mode or None,
+                     seed=args.mock_seed)
+    try:
+        provider = make_provider(args.provider, args.model, **overrides)
+    except ProviderError as e:
+        print(f"[fatal] {e}", file=sys.stderr)
+        return 2
+    if getattr(provider, "ledger", None):
+        print(f"monthly ledger: {provider.ledger.used()}/{provider.ledger.monthly_cap} used in {provider.ledger.month_key}", file=sys.stderr)
+
+    t_start = time.time()
+    n_done = n_aborted = 0
+    stop_reason = None
+    with open(out, "a") as f:
+        try:
+            for i, (task, cond, var, seed) in enumerate(todo):
+                calls_before = getattr(provider, "total_calls", 0)
+                traj = run_trial(provider, task, cond, var, seed, expected_steps=args.expected_steps, max_steps=args.max_steps)
+                f.write(traj.to_json() + "\n")
+                f.flush()
+                n_done += 1
+                fired = sum(1 for s in traj.steps if s.injected_anomaly)
+                parse_failed = sum(1 for s in traj.steps if s.action == "PARSE_FAILED")
+                rels = [s.anomaly_response_relevance for s in traj.steps if s.injected_anomaly]
+                calls = getattr(provider, "total_calls", 0) - calls_before
+                status = "ABORTED" if traj.metadata.aborted_reason else ("ok" if traj.metadata.task_success else "fail")
+                print(f"[{n_done}/{len(todo)}] {traj.metadata.trial_id:45s} steps={len(traj.steps):2d} fired={fired}/{len(traj.metadata.scheduled_anomalies)} "
+                      f"parse_fail={parse_failed} rel={rels} task={status} calls={calls} elapsed={time.time() - t_start:.0f}s", file=sys.stderr)
+                if n_done == 1 and getattr(provider, "last_ratelimit_headers", None):
+                    print(f"    rate-limit headers from the API: {provider.last_ratelimit_headers}", file=sys.stderr)
+                if traj.metadata.aborted_reason:
+                    n_aborted += 1
+                    print(f"    aborted: {traj.metadata.aborted_reason[:200]}", file=sys.stderr)
+                    if traj.metadata.aborted_reason.startswith("QuotaExceeded"):
+                        stop_reason = "quota exceeded -- re-run later; this trial will be retried automatically"
+                        break
+                if args.max_calls is not None and getattr(provider, "total_calls", 0) >= args.max_calls:
+                    stop_reason = f"--max-calls {args.max_calls} reached"
+                    break
+                if args.sleep_between:
+                    time.sleep(args.sleep_between)
+        except KeyboardInterrupt:
+            stop_reason = "interrupted (partial results are on disk; re-run to resume)"
+
+    summary = {"provider": args.provider, "model": model_tag, "out": out, "trials_written": n_done, "aborted": n_aborted,
+               "remaining": len(todo) - n_done, "elapsed_s": round(time.time() - t_start), "stop_reason": stop_reason,
+               "usage": provider.usage_summary() if hasattr(provider, "usage_summary") else None,
+               "finished_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
+    print(json.dumps(summary, indent=2), file=sys.stderr)
+    try:
+        total_lines = sum(1 for line in open(out) if line.strip())
+        print(f"{out}: {total_lines} lines", file=sys.stderr)
+    except OSError:
+        pass
+    return 0 if stop_reason is None else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())
