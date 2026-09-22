@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import os
+from pathlib import Path
 import random
 import subprocess
 import sys
@@ -17,6 +18,8 @@ from runner import run_trial
 from run_grid import build_plan, existing_trial_ids, ALL_TASKS, ALL_CONDITIONS, ALL_VARIANTS
 from metrics import compute_auroc
 import stats
+import tasks
+from tasks import TASKS, TaskEnv
 from stats import TrialRec, Obs, exact_zero_rate, bootstrap_ci, block_permutation_test
 from kappa import cohen_kappa, parse_label
 from judge import parse_judge_json, render_prompt
@@ -453,7 +456,143 @@ def test_run_grid_preflight_flags_missing_posix_shell(tmp_path):
     out = tmp_path / "p.jsonl"
     r = subprocess.run([sys.executable, "run_grid.py", "--provider", "mock", "--pilot", "--dry-run",
                         "--sandbox-shell", "/definitely/not/a/shell-xyz", "--out", str(out)], capture_output=True, text=True, env=env)
-    assert r.returncode == 1 and "does not work" in r.stderr  # an explicit broken shell fails even in dry-run
+    assert r.returncode == 1 and ("does not work" in r.stderr or "does not exist" in r.stderr)  # explicit broken shell fails even in dry-run
     r2 = subprocess.run([sys.executable, "run_grid.py", "--provider", "mock", "--max-trials", "1",
                          "--sandbox-shell", "/definitely/not/a/shell-xyz", "--out", str(out)], capture_output=True, text=True, env=env)
     assert r2.returncode == 1 and "sandbox" in (r2.stderr + r2.stdout).lower()
+
+
+# --------------------------------------------------------------------------- #
+# Windows shell detection (PowerShell: touch is not a command, Git bash is off PATH,
+# test_cumulative.py never calls set_shell())
+# --------------------------------------------------------------------------- #
+def test_git_bash_paths_are_joined_not_unpacked():
+    """Regression: ntpath.join(root, *'bin\\bash.exe') unpacked the string into
+    C:\\b\\a\\s\\h\\.exe, so C:\\Program Files\\Git\\bin\\bash.exe was never found and
+    every trial fell through to PowerShell (where `touch` raises CalledProcessError)."""
+    wanted = {
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+    }
+    queried = []
+
+    def exists(path):
+        queried.append(path)
+        return path in wanted
+
+    def which(name):
+        return r"C:\Program Files\Git\cmd\git.exe" if name in ("git", "git.exe") else None
+
+    cands = [c[0] for c in tasks._candidate_shells(which=which, exists=exists, environ={
+        "ProgramFiles": r"C:\Program Files",
+        "ProgramFiles(x86)": r"C:\Program Files (x86)",
+    })]
+    assert r"C:\Program Files\Git\bin\bash.exe" in cands
+    assert r"C:\Program Files\Git\usr\bin\bash.exe" in cands
+    assert cands[0] == r"C:\Program Files\Git\bin\bash.exe"  # explicit paths before PATH/WSL
+    assert all("-c" == c[1] for c in tasks._candidate_shells(which=which, exists=exists, environ={}) if c[0] in wanted)
+    assert not any("\\b\\a\\s\\h" in p or p.endswith("\\e") for p in queried)
+    # usr\\bin layout only (bin\\bash.exe absent): still found, not character-unpacked
+    cands2 = [c[0] for c in tasks._candidate_shells(
+        which=which, exists=lambda p: p == r"C:\Program Files\Git\usr\bin\bash.exe", environ={})]
+    assert r"C:\Program Files\Git\usr\bin\bash.exe" in cands2
+    assert r"C:\Program Files\Git\bin\bash.exe" not in cands2
+
+
+def test_run_grid_checks_the_same_off_path_git_bash():
+    from run_grid import _GIT_BASH_OFF_PATH, resolve_sandbox_shell
+    assert _GIT_BASH_OFF_PATH == tasks.GIT_BASH_EXPLICIT
+    assert all(p in Path("run_grid.py").read_text() for p in (
+        r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe"))
+    # explicit broken shell fails before any trial, including --dry-run
+    assert resolve_sandbox_shell("/definitely/not/a/shell-xyz")[1]
+
+
+def test_find_posix_shell_requires_working_probe(monkeypatch):
+    """A candidate only counts if it executes a command (stale wsl.exe with no distro must
+    fall through). Do not patch os.name — that makes pathlib.Path a WindowsPath and crashes
+    pytest's cache on Linux."""
+    monkeypatch.setattr(tasks, "_is_windows", lambda: True)
+    monkeypatch.setattr(tasks, "_candidate_shells", lambda **k: [["wsl"], ["good"], ["broken"]])
+    monkeypatch.setattr(tasks, "_probe_shell", lambda pref, timeout=20: pref == ["good"])
+    assert tasks.find_posix_shell() == ["good"]
+    monkeypatch.setattr(tasks, "_probe_shell", lambda pref, timeout=20: False)
+    assert tasks.find_posix_shell() is None
+
+
+def test_active_shell_raises_guidance_on_windows_without_bash(monkeypatch):
+    saved = tasks._SHELL_PREFIX
+    try:
+        monkeypatch.setattr(tasks, "_is_windows", lambda: True)
+        monkeypatch.setattr(tasks, "find_posix_shell", lambda: None)
+        tasks.set_shell(tasks.AUTO)
+        with pytest.raises(RuntimeError, match=r"C:\\Program Files\\Git\\bin\\bash.exe"):
+            tasks.ensure_shell_for_direct_use()
+        with pytest.raises(RuntimeError, match=r"C:\\Program Files\\Git\\usr\\bin\\bash.exe"):
+            tasks.ensure_shell_for_direct_use()  # cached failure, still informative
+    finally:
+        tasks._SHELL_PREFIX = saved
+
+
+def test_taskenv_routes_touch_through_git_bash_not_powershell(monkeypatch):
+    """The failure mode: test_cumulative.py calls TaskEnv.setup() with no set_shell(), and
+    on Windows shell=True is PowerShell, which has no `touch`. The resolved prefix must be
+    used, and /usr/bin (where Git bash keeps touch) prepended."""
+    calls = []
+
+    class R:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(tasks.subprocess, "run", lambda argv, **kw: calls.append((argv, kw)) or R())
+    monkeypatch.setattr(tasks, "_active_shell", lambda: [r"C:\Program Files\Git\bin\bash.exe", "-c"])
+    monkeypatch.setattr(tasks, "_is_windows", lambda: True)
+    env = TaskEnv(TASKS["log_rotation"])
+    try:
+        env.setup()
+    finally:
+        env.cleanup()
+    argv, kw = calls[0]
+    assert argv[0] == r"C:\Program Files\Git\bin\bash.exe" and argv[1] == "-c"
+    assert "touch app1.log app2.log" in argv[2]
+    assert argv[2].startswith('export PATH="/usr/bin:/bin:')
+    assert "shell" not in kw  # must not be shell=True (that is PowerShell/cmd)
+
+
+def test_session_fixture_initializes_shell_without_per_test_set_shell():
+    """conftest.posix_sandbox_shell calls ensure_shell_for_direct_use before tests. After
+    that, a direct TaskEnv (the test_cumulative.py pattern) must not still be on AUTO."""
+    assert tasks._SHELL_PREFIX is not tasks.AUTO
+    if os.name != "nt":
+        assert tasks.current_shell() is None  # native /bin/sh
+    else:
+        shell = tasks.current_shell()
+        assert shell and "bash" in " ".join(shell).lower() and shell[-1] == "-c"
+
+
+def test_harness_scripts_find_python_when_python3_is_absent(tmp_path):
+    """Git Bash rarely exposes `python3`. Setup scripts must not hardcode it, and must
+    run via `python` (or `py`) when that is the only interpreter on PATH."""
+    for task in TASKS.values():
+        assert "python3 -c" not in task.setup_script
+        assert "python3 health.py" not in task.success_script and "python3 -m" not in task.success_script
+    if os.name == "nt":
+        pytest.skip("PATH emulation is POSIX; Windows coverage is the Git-bash detection tests")
+    shimdir = tmp_path / "bin"
+    shimdir.mkdir()
+    try:
+        (shimdir / "python").symlink_to(sys.executable)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not permitted")
+    env = TaskEnv(TASKS["python_test"])
+    env.env["PATH"] = str(shimdir)
+    try:
+        from tasks import _PYSHIM
+        out, err, code, _ = env.run_cmd(_PYSHIM + "echo FOUND:$PYBIN; command -v python3 || echo NO_PYTHON3")
+        assert code == 0 and "FOUND:python" in out and "NO_PYTHON3" in out, (out, err, code)
+        env.setup()
+        out, err, code, _ = env.run_cmd("test -s test_app.py && echo WROTE")
+        assert "WROTE" in out, (out, err, code)
+    finally:
+        env.cleanup()

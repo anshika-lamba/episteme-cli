@@ -102,9 +102,13 @@ Still open (`[DECIDE]` in PREREG.md):
   commit -m "pilot" && git push` (any filename under `results/` works; `stats.py` re-derives the
   response relevance on load).
 * **Decided 2026-09-22: the author runs `run_grid.py` locally on Windows (PowerShell).** The
-  harness now routes all task scripts through a POSIX shell (auto-detected `wsl`/Git-bash;
-  `--sandbox-shell` to force) and runs a quota-free preflight (shell echo probe, 8 required
-  tools, all 4 task setups) that refuses to start rather than burn 2,000 calls on a dead
+  harness routes every task script through a POSIX shell. Git for Windows does **not** put
+  bash on PATH (only `git.exe`), so detection explicitly checks
+  `C:\Program Files\Git\bin\bash.exe` and `C:\Program Files\Git\usr\bin\bash.exe`, then bash
+  next to `git.exe`, then WSL — and a session fixture (`conftest.py`) installs that shell
+  before tests, so `test_cumulative.py` (which calls `TaskEnv.setup()` directly, no
+  `set_shell()`) does not hit PowerShell's missing `touch`. Quota-free preflight (echo probe,
+  required tools, all 4 task setups) refuses to start rather than burn 2,000 calls on a dead
   sandbox. Push `results/` (incl. `harness_*.jsonl`) to this branch after/while running and the
   analysis side (stats, sampling, kappa) can run anywhere; runs resume from committed files.
 * (Fallback, unused for now) GitHub Actions (`.github/workflows/run_experiment.yml`) runs

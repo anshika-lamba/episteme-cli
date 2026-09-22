@@ -30,6 +30,7 @@ def run_trial(provider, task_name: str, condition: str, variant: str, seed: int,
         # and must not kill the grid: record it and move on.
         traj.metadata.aborted_reason = f"sandbox_setup_failed: {str(e)[:200]}"
         traj.metadata.task_success = False
+        env.cleanup()
         return traj
     history = [{"role": "user", "content": build_system_prompt(task.prompt, condition, variant)}]
     consecutive_failures = 0

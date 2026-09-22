@@ -29,9 +29,6 @@ import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
-import shutil
-import subprocess
-
 from providers import make_provider, list_models, ProviderError, QuotaExceededError, REGISTRY, effective_limits
 from harness_summary import JsonlSink, summarize_events
 import tasks as tasks_mod
@@ -48,27 +45,48 @@ PRIORITY = dict(tasks=ALL_TASKS, conditions=["control", "real_skill"], variants=
 CALLS_PER_TRIAL_EST = 8  # planning figure: <= max_steps (10); typical 5-8
 
 
-REQUIRED_TOOLS = ["python3", "md5sum", "tar", "sed", "printf", "touch", "grep", "cat"]  # used by the 4 task scripts
+REQUIRED_TOOLS = ["md5sum", "tar", "sed", "printf", "touch", "grep", "cat"]  # used by the 4 task scripts (python is probed separately: python3|python|py)
 OPTIONAL_TOOLS = ["pytest"]
 
+# Git for Windows does not put bash.exe on PATH (only cmd\git.exe). Check both layouts
+# explicitly — shutil.which("bash") is not enough on a default PowerShell install.
+_GIT_BASH_OFF_PATH = (
+    r"C:\Program Files\Git\bin\bash.exe",
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+)
 
-def resolve_sandbox_shell(choice: str) -> Optional[list]:
-    """Return a prefix like ["bash", "-lc"], or None for native shell=True (fine on POSIX)."""
-    if os.name != "nt" and choice == "auto":
-        return None  # /bin/sh is already POSIX
-    candidates = []
-    if choice not in ("auto", "native"):
-        candidates = [[choice, "-lc"]] if shutil.which(choice) or os.path.sep in choice else []
-    elif os.name == "nt":
-        candidates = [["wsl", "-e", "bash", "-lc"], ["bash", "-lc"], ["sh", "-lc"]]
-    for pref in candidates:
-        try:
-            r = subprocess.run(pref + ['echo __EPISTEME_SHELL_OK__'], capture_output=True, text=True, timeout=30)
-            if "__EPISTEME_SHELL_OK__" in (r.stdout or ""):
-                return pref
-        except Exception:
-            continue
-    return None
+
+def resolve_sandbox_shell(choice: str) -> Tuple[Optional[list], Optional[str]]:
+    """-> (shell_prefix | None, error_message).
+
+    On Windows, auto checks the two Git-for-Windows bash.exe paths itself (they are not
+    on PATH), then tasks.find_posix_shell() for git.exe siblings, Program Files (x86),
+    and WSL. TaskEnv uses the same finder, so tests that never call set_shell() agree
+    with this CLI.
+    """
+    if choice == "native":
+        return None, None
+    if choice == "auto":
+        if os.name != "nt":
+            return None, None
+        for path in _GIT_BASH_OFF_PATH:
+            if os.path.isfile(path) and tasks_mod._probe_shell([path, "-c"]):
+                return [path, "-c"], None
+        shell = tasks_mod.find_posix_shell()
+        if shell:
+            return shell, None
+        return None, (
+            "no POSIX shell found. Checked "
+            + " and ".join(_GIT_BASH_OFF_PATH)
+            + ", bash.exe next to git.exe, bash/sh on PATH, and WSL. "
+            "PowerShell cannot run touch/md5sum/tar."
+        )
+    pref = [choice, "-c"]
+    if (os.path.sep in choice or "/" in choice) and not os.path.isfile(choice):
+        return None, f"--sandbox-shell {choice!r} does not exist"
+    if not tasks_mod._probe_shell(pref):
+        return None, f"--sandbox-shell {choice!r} does not work (failed the echo probe)"
+    return pref, None
 
 
 def preflight() -> list:
@@ -86,6 +104,9 @@ def preflight() -> list:
             out, _e, code, _ = probe(f"command -v {tool} >/dev/null 2>&1 && echo FOUND")
             if "FOUND" not in out:
                 (warns if tool in OPTIONAL_TOOLS else problems).append(f"missing tool: {tool}")
+        out, _e, _c, _ = probe('for p in python3 python py; do command -v "$p" >/dev/null 2>&1 && { echo FOUND; break; }; done')
+        if "FOUND" not in out:
+            problems.append("no python reachable (python3 | python | py) - the harness scripts need an interpreter")
         for t in TASKS.values():  # every task must set up and not trivially succeed
             te = TaskEnv(t)
             try:
@@ -124,7 +145,7 @@ def existing_trial_ids(path: str) -> Tuple[Set[str], Set[str]]:
     ids, models = set(), set()
     if not os.path.exists(path):
         return ids, models
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -170,7 +191,10 @@ def main() -> int:
     ap.add_argument("--list-models", action="store_true")
     ap.add_argument("--mock-seed", type=int, default=0)
     ap.add_argument("--harness-log", default=None, help="JSONL of harness-level events (429/5xx/parse failures/quota); default results/harness_{provider}_{model}.jsonl")
-    ap.add_argument("--sandbox-shell", default="auto", help="auto|native|<path to bash/sh>: on Windows 'auto' tries wsl, Git-bash, sh (tasks need POSIX; cmd.exe cannot run them)")
+    ap.add_argument("--sandbox-shell", default="auto",
+                    help="auto|native|<path to bash.exe>. On Windows, auto checks "
+                         r"C:\Program Files\Git\bin\bash.exe and C:\Program Files\Git\usr\bin\bash.exe "
+                         "(Git does not put bash on PATH; PowerShell/cmd.exe cannot run the tasks)")
     ap.add_argument("--no-preflight", action="store_true", help="skip the 2-second sandbox sanity checks (not recommended)")
     args = ap.parse_args()
 
@@ -216,17 +240,18 @@ def main() -> int:
               f"monthly_cap={args.monthly_cap or spec.get('monthly_cap')} | {REGISTRY[args.provider]['notes']}", file=sys.stderr)
         print(f"budget: >= {est_calls / rpm:.0f} min at the RPM ceiling; >= {est_calls / rpd:.1f} days at the RPD cap", file=sys.stderr)
     if not args.no_preflight:
-        shell = resolve_sandbox_shell(args.sandbox_shell)
-        if shell is None and args.sandbox_shell not in ("auto", "native") and os.name != "nt":
-            # explicit --sandbox-shell that cannot even echo a marker: fail loudly, never silently native
-            print(f"[preflight] FAIL: --sandbox-shell {args.sandbox_shell!r} does not work (failed the echo probe)", file=sys.stderr)
+        shell, err = resolve_sandbox_shell(args.sandbox_shell)
+        if err:
+            print(f"[preflight] FAIL: {err}", file=sys.stderr)
+            print("Fix: install Git for Windows or WSL, pass --sandbox-shell <path to bash.exe>, or run on Linux.", file=sys.stderr)
             return 1
-        if shell is None and os.name == "nt":
-            print("[preflight] Windows: no POSIX shell found (tried wsl, bash, sh); falling back to cmd.exe, which will fail the task checks below. Install Git for Windows or use WSL.", file=sys.stderr)
         if shell:
             print(f"[preflight] routing sandbox commands through: {shell[0]}", file=sys.stderr)
         tasks_mod.set_shell(shell)
-        problems = preflight()
+        try:
+            problems = preflight()
+        except Exception as e:  # e.g. TaskEnv spawn machinery itself unusable
+            problems = [f"sandbox unusable: {str(e)[:200]}"]
         if problems:
             print("[preflight] FAIL — refusing to start (nothing wasted):", file=sys.stderr)
             for pr in problems:
