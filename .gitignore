@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-.quota/            # persistent per-month call ledgers (Cohere) -- machine-local
-results/mock_*     # offline smoke-test output
+# persistent per-month call ledgers (Cohere) -- machine-local
+.quota/
+# offline smoke-test output (real results/*.jsonl ARE tracked)
+results/mock_*
 results/pilot_mock_*
 labeling/*.tmp
 .env
