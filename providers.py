@@ -28,6 +28,7 @@ import datetime as _dt
 import inspect
 import json
 import os
+import random
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -202,11 +203,15 @@ class CallLedger:
 # --------------------------------------------------------------------------- #
 # JSON extraction / validation (agent responses)
 # --------------------------------------------------------------------------- #
-_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+# Repair is formatting-only. A missing relevance is still a ParseError: imputing
+# 0.0 would inflate exact_zero_rate, which is the primary outcome (PREREG B3/B7).
+# ParseError is recorded and the trial continues; it is not a fatal grid abort.
+_FENCE_RE = re.compile(r"```(?:json|JSON)?\s*", re.IGNORECASE)
+_RNG = random.Random()
 
 
-def _balanced_object_spans(text: str) -> List[str]:
-    """Return every top-level {...} span, respecting string literals."""
+def _balanced_spans(text: str, open_ch: str, close_ch: str) -> List[str]:
+    """Top-level spans of open_ch/close_ch, respecting double-quoted strings."""
     spans: List[str] = []
     depth, start, in_str, esc = 0, None, False, False
     for i, ch in enumerate(text):
@@ -220,11 +225,11 @@ def _balanced_object_spans(text: str) -> List[str]:
             continue
         if ch == '"':
             in_str = True
-        elif ch == "{":
+        elif ch == open_ch:
             if depth == 0:
                 start = i
             depth += 1
-        elif ch == "}" and depth > 0:
+        elif ch == close_ch and depth > 0:
             depth -= 1
             if depth == 0 and start is not None:
                 spans.append(text[start:i + 1])
@@ -232,17 +237,78 @@ def _balanced_object_spans(text: str) -> List[str]:
     return spans
 
 
-def _last_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """Last JSON object in `text` (prefers fenced blocks). None if nothing parses."""
-    candidates = _FENCE_RE.findall(text) or _balanced_object_spans(text)
-    for cand in reversed(candidates):
+def _strip_markdown(text: str) -> str:
+    text = (text or "").replace("\ufeff", "")
+    text = _FENCE_RE.sub("", text)
+    return text.replace("```", "")
+
+
+def _repair_json_text(s: str) -> str:
+    """Fix the malformations seen in the pilot: smart quotes, trailing commas,
+    Python literals, a single missing closer, and single-quoted objects that
+    contain no double quotes (so a command with an apostrophe is left alone)."""
+    s = s.strip().replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    if '"' not in s and "'" in s:
+        s = s.replace("'", '"')
+    s = re.sub(r"\bTrue\b", "true", s)
+    s = re.sub(r"\bFalse\b", "false", s)
+    s = re.sub(r"\bNone\b", "null", s)
+    # one or two unclosed brackets (model stopped mid-object); not a general JSON repair
+    deficit = s.count("{") - s.count("}")
+    if 0 < deficit <= 2:
+        s += "}" * deficit
+    deficit = s.count("[") - s.count("]")
+    if 0 < deficit <= 2:
+        s += "]" * deficit
+    return s
+
+
+def _loads_lenient(s: str) -> Any:
+    s = (s or "").strip()
+    if not s:
+        return None
+    for cand in (s, _repair_json_text(s)):
         try:
-            obj = json.loads(cand)
+            return json.loads(cand)
         except json.JSONDecodeError:
-            continue  # e.g. prose in braces after the real answer
-        if isinstance(obj, dict):
-            return obj
+            continue
     return None
+
+
+def _iter_json_values(text: str) -> List[Any]:
+    """json.loads on the raw text, then on the fence-stripped text, then on every
+    balanced object or array. Order is left-to-right; callers pick the last value
+    that actually validates so a trailing `{}` or prose brace does not hide the
+    real answer, and an echoed example does not beat the later answer."""
+    raw = text or ""
+    stripped = _strip_markdown(raw)
+    found: List[Any] = []
+    for blob in (raw, stripped):
+        obj = _loads_lenient(blob)
+        if obj is not None:
+            found.append(obj)
+    for span in _balanced_spans(stripped, "{", "}") + _balanced_spans(stripped, "[", "]"):
+        obj = _loads_lenient(span)
+        if obj is not None:
+            found.append(obj)
+    return found
+
+
+def _dicts_in(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _last_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Last parsed object (validation-free; the judge uses this)."""
+    dicts: List[Dict[str, Any]] = []
+    for value in _iter_json_values(text):
+        dicts.extend(_dicts_in(value))
+    return dicts[-1] if dicts else None
 
 
 def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -251,35 +317,37 @@ def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _coerce_relevance(value: Any) -> Optional[float]:
+    """Float in the caller's range check. Lists unwrap to the last numeric element
+    (models sometimes emit a relevance array). None/bool/garbage stay None so the
+    caller can record a parse failure instead of inventing 0.0."""
+    if isinstance(value, list):
+        nums = [n for n in (_coerce_relevance(v) for v in value) if n is not None]
+        return nums[-1] if nums else None
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
+        s = value.strip()
+        if s.endswith("%"):
+            return None  # "95%" is not a probability; do not rescale it into exact-zero
         try:
-            return float(value.strip())
+            return float(s)
         except ValueError:
             return None
     return None
 
 
-def extract_last_json(text: str, variant: str) -> Dict[str, Any]:
-    """Parse + validate an agent response. Raises ParseError with a specific reason.
-
-    Rules (PREREG §4 -- malformed output is recorded, then excluded):
-      * take the LAST JSON object in the reply (a trailing `{}` therefore fails);
-      * `command` must be a non-empty string;
-      * `relevance` must be a number in [0, 1] unless variant == "no_numeric",
-        in which case it is forced to None (that arm has no numeric channel).
-    """
-    parsed = _last_json_object(text or "")
-    if parsed is None:
-        raise ParseError("No valid JSON object found in response.")
+def _validate_agent_object(parsed: Dict[str, Any], variant: str) -> Dict[str, Any]:
     command = parsed.get("command")
     if not isinstance(command, str) or not command.strip():
         raise ParseError("JSON missing or invalid 'command' string.")
+    parsed["command"] = command.strip()
     reasoning = parsed.get("reasoning", "")
     parsed["reasoning"] = reasoning if isinstance(reasoning, str) else json.dumps(reasoning)
+    raw_rel = parsed.get("relevance")
+    if isinstance(raw_rel, list):
+        parsed["_relevance_coerced"] = "array_last"
     if variant == "no_numeric":
         parsed["relevance"] = None
         return parsed
@@ -287,9 +355,31 @@ def extract_last_json(text: str, variant: str) -> Dict[str, Any]:
         raise ParseError("JSON missing 'relevance'.")
     rel = _coerce_relevance(parsed.get("relevance"))
     if rel is None or not (0.0 <= rel <= 1.0):
+        # a percent like "95%" is not a probability; do not silently rescale into [0, 1]
+        if isinstance(raw_rel, str) and raw_rel.strip().endswith("%"):
+            raise ParseError("JSON 'relevance' must be a float between 0.0 and 1.0.")
         raise ParseError("JSON 'relevance' must be a float between 0.0 and 1.0.")
     parsed["relevance"] = rel
     return parsed
+
+
+def extract_last_json(text: str, variant: str) -> Dict[str, Any]:
+    """Parse + validate an agent response. Raises ParseError with a specific reason.
+
+    Order: json.loads on the raw text, then markdown fences stripped, then every
+    balanced `{...}` / `[...]` with trailing-comma and quote repair. The last
+    object that has a command is validated. A trailing empty `{}` therefore no
+    longer hides a real answer. Missing relevance is still a ParseError — it is
+    recorded, not replaced with 0.0 (that would bias exact_zero_rate).
+    """
+    dicts: List[Dict[str, Any]] = []
+    for value in _iter_json_values(text or ""):
+        dicts.extend(_dicts_in(value))
+    if not dicts:
+        raise ParseError("No valid JSON object found in response.")
+    usable = [d for d in dicts if isinstance(d.get("command"), str) and d.get("command", "").strip()]
+    chosen = usable[-1] if usable else dicts[-1]
+    return _validate_agent_object(dict(chosen), variant)
 
 
 # --------------------------------------------------------------------------- #
@@ -298,10 +388,21 @@ def extract_last_json(text: str, variant: str) -> Dict[str, Any]:
 _QUOTA_HINTS = ("per day", "daily", "per_day", "perday", "month", "quota exceeded", "monthly")
 
 
+# 8 retries after the first attempt (9 tries). Daily/monthly quota 429s are NOT
+# retried — they cannot clear in 10–30s, and retrying them burns the night.
+DEFAULT_TRANSPORT_RETRIES = 8
+
+
 def _sleep_backoff(attempt: int, retry_after: Optional[float]) -> float:
+    """Jittered exponential backoff for transient 429/503/network errors.
+
+    With no Retry-After, attempt 0 sleeps uniform(10, 30) seconds (the floor that
+    keeps a thundering herd off a just-reset window) and later attempts double
+    that, capped at 180s. A server Retry-After is honored, plus a short jitter.
+    """
     if retry_after and retry_after > 0:
-        return min(float(retry_after) + 0.5, 120.0)
-    return min(2.0 * (2 ** attempt), 60.0)
+        return min(max(float(retry_after), 1.0) + _RNG.uniform(0.25, 1.5), 180.0)
+    return min(_RNG.uniform(10.0, 30.0) * (2 ** attempt), 180.0)
 
 
 class BaseProvider:
@@ -313,7 +414,7 @@ class BaseProvider:
 
     def __init__(self, model_name: str, rpm: int = 15, tpm: int = 10000, rpd: int = 1000,
                  api_key: Optional[str] = None, max_output_tokens: int = 400, temperature: float = 0.0,
-                 transport_retries: int = 4, min_interval_s: float = 0.0, monthly_cap: Optional[int] = None,
+                 transport_retries: int = DEFAULT_TRANSPORT_RETRIES, min_interval_s: float = 0.0, monthly_cap: Optional[int] = None,
                  ledger_dir: str = ".quota", json_mode: bool = False, timeout_s: int = 60):
         if requests is None:
             raise ProviderError("The 'requests' package is required: pip install requests")
@@ -453,6 +554,8 @@ class BaseProvider:
         except ParseError as e:
             self._emit("model_output", "parse_failed", reason=str(e), raw=(text or "")[:300], out_tokens=int(out_tok or 0))
             raise
+        if parsed.get("_relevance_coerced"):
+            self._emit("model_output", "relevance_coerced", how=parsed.get("_relevance_coerced"), relevance=parsed.get("relevance"))
         parsed["_raw_text"] = text[:2000]
         return parsed, int(out_tok or 0), latency_ms
 

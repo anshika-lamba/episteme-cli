@@ -12,8 +12,12 @@ Design
 * Grid = tasks x conditions x variants x seeds. Within a seed, cells are ordered
   round-robin over conditions, so a run killed half-way still leaves the
   conditions balanced (the primary comparison is control vs real_skill).
-* Every finished trajectory is appended + flushed immediately (JSONL). Re-running
+* Every finished trajectory is appended, flushed and fsync'd (JSONL). Re-running
   the same command skips trial_ids already present in --out (resume by default).
+  A trailing partial line from a reboot is truncated. Trials aborted by a quota
+  wall, a sandbox setup failure, or transport exhaustion ("gave up after") are
+  dropped and re-queued; a finished trial that merely logged a ProviderError
+  (e.g. HTTP 400) stays skipped.
 * QuotaExceededError (daily/monthly cap) stops the run cleanly; the partial
   trajectory is still written with metadata.aborted_reason set.
 * Pilot = 2 tasks x 3 conditions x 3 variants x seed 0 = 18 trials, i.e. one of
@@ -141,10 +145,100 @@ def build_plan(tasks: List[str], conditions: List[str], variants: List[str], see
     return plan
 
 
+def note_trial_abort(consecutive_gave_up: int, reason: Optional[str], limit: int) -> Tuple[int, Optional[str]]:
+    """Count consecutive transport-exhaustion aborts. After `limit` in a row, stop this
+    provider (the trials are re-queued on resume) so an overnight run can move on.
+    Any other outcome resets the counter. limit <= 0 disables the breaker."""
+    if reason and "gave up after" in reason:
+        consecutive_gave_up += 1
+        if limit > 0 and consecutive_gave_up >= limit:
+            return consecutive_gave_up, (
+                f"{consecutive_gave_up} trials in a row exhausted transport retries; "
+                "stopping this provider so the night can continue. Re-run to resume these trials."
+            )
+        return consecutive_gave_up, None
+    return 0, None
+
+
+def is_retryable_abort(reason: Optional[str]) -> bool:
+    """Trials that did not produce a usable record and should be re-run on resume.
+
+    Quota walls, a missing sandbox, and transport exhaustion ("gave up after N
+    attempts") are harness failures, not measurements. A generic ProviderError
+    (bad model, HTTP 400) is kept so a permanent rejection is not retried all night.
+    """
+    reason = reason or ""
+    if not reason:
+        return False
+    if reason.startswith("QuotaExceeded") or reason.startswith("sandbox_setup_failed"):
+        return True
+    return "gave up after" in reason
+
+
+def repair_jsonl_tail(path: str) -> bool:
+    """Truncate a torn last line (process killed mid-write). Returns True if bytes were dropped.
+
+    A line that ends in a newline is kept even if it does not parse — that is corruption
+    in the middle of a finished write, and silently deleting it would hide data loss.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    with open(path, "rb") as f:
+        data = f.read()
+    if data.endswith(b"\n"):
+        return False
+    last_nl = data.rfind(b"\n")
+    keep = data[: last_nl + 1] if last_nl >= 0 else b""
+    tmp = path + ".tail.tmp"
+    with open(tmp, "wb") as f:
+        f.write(keep)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return True
+
+
+def compact_retryable(path: str) -> int:
+    """Drop trials whose latest line is a retryable abort, so a resumed run does not
+    leave two copies of the same trial_id for stats.py. Returns how many trials were dropped."""
+    if not os.path.exists(path):
+        return 0
+    repair_jsonl_tail(path)
+    latest: Dict[str, Tuple[str, bool]] = {}
+    order: List[str] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                meta = json.loads(raw).get("metadata") or {}
+            except json.JSONDecodeError:
+                continue
+            tid = meta.get("trial_id") or ""
+            if tid not in latest:
+                order.append(tid)
+            latest[tid] = (raw, not is_retryable_abort(meta.get("aborted_reason")))
+    dropped = sum(1 for tid in order if not latest[tid][1])
+    if not dropped:
+        return 0
+    tmp = path + ".compact.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for tid in order:
+            raw, complete = latest[tid]
+            if complete and tid:
+                f.write(raw + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return dropped
+
+
 def existing_trial_ids(path: str) -> Tuple[Set[str], Set[str]]:
     ids, models = set(), set()
     if not os.path.exists(path):
         return ids, models
+    repair_jsonl_tail(path)
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -154,8 +248,8 @@ def existing_trial_ids(path: str) -> Tuple[Set[str], Set[str]]:
                 meta = json.loads(line).get("metadata", {})
             except json.JSONDecodeError:
                 continue
-            if (meta.get("aborted_reason") or "").startswith("QuotaExceeded"):
-                continue  # re-run trials that died on a quota wall
+            if is_retryable_abort(meta.get("aborted_reason")):
+                continue  # re-run quota walls, sandbox setup failures, transport exhaustion
             ids.add(meta.get("trial_id", ""))
             models.add(meta.get("agent_version", ""))
     return ids, models
@@ -179,6 +273,12 @@ def main() -> int:
     ap.add_argument("--tpm", type=int, default=None)
     ap.add_argument("--rpd", type=int, default=None)
     ap.add_argument("--min-interval", type=float, default=None, help="seconds between calls (Mistral ~1.1)")
+    ap.add_argument("--transport-retries", type=int, default=8,
+                    help="retries after the first attempt for HTTP 429/503/network (default 8; "
+                         "daily/monthly quota 429s are not retried)")
+    ap.add_argument("--gave-up-stop", type=int, default=3,
+                    help="stop this provider after N trials in a row exhaust transport retries "
+                         "(0 disables; those trials are re-queued on resume)")
     ap.add_argument("--monthly-cap", type=int, default=None, help="persistent per-month call cap (.quota/)")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--max-output-tokens", type=int, default=400)
@@ -221,6 +321,10 @@ def main() -> int:
     out = args.out or os.path.join("results", f"{'pilot_' if args.pilot else ''}{args.provider}_{safe_model}.jsonl")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
+    if not args.no_resume and os.path.exists(out):
+        dropped = compact_retryable(out)
+        if dropped:
+            print(f"[resume] dropped {dropped} retryable abort(s) from {out} so they will be re-run", file=sys.stderr)
     done_ids, done_models = (set(), set()) if args.no_resume else existing_trial_ids(out)
     if done_models and any(m and m != model_tag for m in done_models):
         print(f"[warn] {out} already contains other models: {sorted(done_models)} (use --out to separate them)", file=sys.stderr)
@@ -273,7 +377,7 @@ def main() -> int:
 
     overrides = dict(rpm=args.rpm, tpm=args.tpm, rpd=args.rpd, min_interval_s=args.min_interval, monthly_cap=args.monthly_cap,
                      temperature=args.temperature, max_output_tokens=args.max_output_tokens, json_mode=args.json_mode or None,
-                     seed=args.mock_seed)
+                     transport_retries=args.transport_retries, seed=args.mock_seed)
     try:
         provider = make_provider(args.provider, args.model, **overrides)
     except ProviderError as e:
@@ -292,6 +396,8 @@ def main() -> int:
     t_start = time.time()
     n_done = n_aborted = 0
     stop_reason = None
+    stop_code = 0
+    consecutive_gave_up = 0
     with open(out, "a", encoding="utf-8") as f:
         try:
             for i, (task, cond, var, seed) in enumerate(todo):
@@ -314,14 +420,25 @@ def main() -> int:
                     print(f"    aborted: {traj.metadata.aborted_reason[:200]}", file=sys.stderr)
                     if traj.metadata.aborted_reason.startswith("QuotaExceeded"):
                         stop_reason = "quota exceeded -- re-run later; this trial will be retried automatically"
+                        stop_code = 3
                         break
+                    consecutive_gave_up, breaker = note_trial_abort(
+                        consecutive_gave_up, traj.metadata.aborted_reason, args.gave_up_stop)
+                    if breaker:
+                        stop_reason = breaker
+                        stop_code = 4
+                        break
+                else:
+                    consecutive_gave_up = 0
                 if args.max_calls is not None and getattr(provider, "total_calls", 0) >= args.max_calls:
                     stop_reason = f"--max-calls {args.max_calls} reached"
+                    stop_code = 3
                     break
                 if args.sleep_between:
                     time.sleep(args.sleep_between)
         except KeyboardInterrupt:
             stop_reason = "interrupted (partial results are on disk; re-run to resume)"
+            stop_code = 3
 
     summary = {"provider": args.provider, "model": model_tag, "out": out, "trials_written": n_done, "aborted": n_aborted,
                "remaining": len(todo) - n_done, "elapsed_s": round(time.time() - t_start), "stop_reason": stop_reason,
@@ -335,7 +452,7 @@ def main() -> int:
         print(f"{out}: {total_lines} lines", file=sys.stderr)
     except OSError:
         pass
-    return 0 if stop_reason is None else 3
+    return stop_code
 
 
 if __name__ == "__main__":

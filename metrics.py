@@ -57,14 +57,21 @@ def iter_jsonl(paths: Iterable[str]):
         if not os.path.exists(path):
             raise FileNotFoundError(path)
         with open(path, encoding="utf-8") as f:
-            for line_no, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
+            raw = f.read()
+        ends_clean = raw.endswith("\n") or raw == ""
+        lines = raw.splitlines()
+        for line_no, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield path, line_no, json.loads(line)
+            except json.JSONDecodeError as e:
+                # A reboot can tear the last line. Skip only that case; a corrupt
+                # finished line in the middle of the file is real data loss and must raise.
+                if line_no == len(lines) and not ends_clean:
                     continue
-                try:
-                    yield path, line_no, json.loads(line)
-                except json.JSONDecodeError as e:
-                    raise ValueError(f"{path}:{line_no}: bad JSON ({e})")
+                raise ValueError(f"{path}:{line_no}: bad JSON ({e})")
 
 
 def load_trajectories(paths: Iterable[str], derive: bool = True) -> List[Trajectory]:

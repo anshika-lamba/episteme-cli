@@ -72,7 +72,8 @@ def test_json_extractor():
     t1 = "I think I should list files.\n```json\n{\"command\": \"ls\", \"relevance\": 0.5}\n```"
     assert extract_last_json(t1, "neutral")["command"] == "ls"
     
-    with pytest.raises(ParseError): extract_last_json('{"command": "ls", "relevance": 0.5} {}', "neutral")
+    parsed_trail = extract_last_json('{"command": "ls", "relevance": 0.5} {}', "neutral")
+    assert parsed_trail["command"] == "ls" and parsed_trail["relevance"] == 0.5
     with pytest.raises(ParseError): extract_last_json('{"command": 123, "relevance": 0.5}', "neutral")
     with pytest.raises(ParseError): extract_last_json('{"command": "ls"}', "neutral") 
     with pytest.raises(ParseError): extract_last_json('{"command": "ls", "relevance": 1.5}', "neutral") 

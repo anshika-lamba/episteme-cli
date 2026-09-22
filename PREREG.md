@@ -121,7 +121,9 @@ per-family 95 % CI half-width ≈ ±0.09 at a rate of 0.3. We will **not** exten
 reach 1,000 should-act observations (≈ 2,200 trials): the free-tier caps make that infeasible
 and ≈ 450 is adequate for H1–H3. Data collection stops when the seed budget above is done or
 the caps/time run out, whichever is first; the achieved *n* is reported per cell. No interim
-result influences how many trials are run.
+result influences how many trials are run. `run_overnight.ps1` defaults to this table (Cohere
+held). A 7-family × 1,000-trial invocation exists only behind `-AllowOverBudget` and is not
+the preregistered design.
 
 ### B6. Judge validation (Phase 4)
 60 anomaly steps sampled stratified by kind (`sample_for_labeling.py`), labelled **blind**
@@ -135,11 +137,29 @@ limitation; relevance metrics (H1, H2, H3) do not depend on the judge.
 
 ### B7. Exclusions and reliability
 * `PARSE_FAILED` steps (no valid JSON after validation) are recorded and excluded; two in a row
-  end the trial. The parse-failure rate is reported per model.
+  end the trial. The parse-failure rate is reported per model. A parse failure does **not**
+  abort the grid.
+* Response text is repaired before validation (2026-09-22, pre-analysis): `json.loads` on the
+  raw text, then markdown fences stripped, then every balanced object or array, with trailing
+  commas, smart quotes, Python `True`/`False`/`None`, and one missing closer repaired. The
+  last object that has a command is kept, so a trailing empty `{}` or an echoed example does
+  not hide the answer. A relevance *array* is reduced to its last in-range number and flagged
+  `_relevance_coerced` (not written back into the prompt history). This is formatting repair
+  only. Missing, null, boolean, percent, or out-of-range relevance remains a parse failure
+  and is **not** imputed as 0.0 — imputing 0.0 would inflate `exact_zero_rate`. A bare numeric
+  array with no command is a parse failure; a shell command is not invented.
 * Anomalies with no observable next valid action (fired on the final step) are excluded from
   all rates; the count is reported.
-* `PROVIDER_ERROR` steps end the trial; steps before the error are kept. Trials aborted by a
-  quota wall are re-run automatically (`run_grid.py` resume).
+* `PROVIDER_ERROR` steps end the trial; steps before the error are kept. Resume re-runs a
+  trial aborted by a quota wall, a sandbox setup failure, or transport exhaustion
+  (`gave up after`). A finished trial whose abort was a permanent `ProviderError` (for
+  example HTTP 400) stays skipped. Each JSONL append is flushed and `fsync`'d; a torn trailing
+  line from a reboot is truncated before resume and skipped by `stats.py`.
+* Transient HTTP 429 (no daily/monthly quota wording) and HTTP 503/5xx/network errors are
+  retried up to 8 times with jittered exponential backoff: uniform(10, 30) seconds on the
+  first retry, doubled each attempt, capped at 180s; a server `Retry-After` is honored.
+  Exhaustion aborts that trial only. A quota-shaped 429 is terminal for the run — retrying
+  it eight times cannot clear a daily cap and would burn the night.
 * The relevance field is coerced from numeric strings; booleans and out-of-range values are
   parse failures. In `no_numeric` the field is discarded even if the model emits one.
 

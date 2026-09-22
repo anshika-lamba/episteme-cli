@@ -46,6 +46,7 @@ or on Linux/macOS/Termux: `export GROQ_API_KEY=... GEMINI_API_KEY=... MISTRAL_AP
 | 3 · pilot analysis | `python stats.py results/pilot_groq_allam-2-7b.jsonl` · `python inspect_trajectories.py results/pilot_groq_allam-2-7b.jsonl --n 5 --anomalies-only` |
 | 4 · judge validation | `python sample_for_labeling.py "results/*.jsonl" --n 60` → fill `labeling/labels.csv` (blind) → `python run_judge.py --provider gemini` → `python kappa.py` |
 | 5 · full grid | `python run_grid.py --provider groq --seeds 9` · `--provider mistral --seeds 9` · `--provider gemini --seeds 7` (= `gemma-3-12b-it`) · later `--provider cohere --subset priority --seeds 6` (all resumable; re-run the same command after a quota wall) |
+| 5 · overnight | `.\run_overnight.ps1` — the three lines above, one provider at a time, resume-safe. Does **not** start Cohere or 7×1000. `.\run_overnight.ps1 -DryRun` prints the plan. |
 | 6 · full stats | `python stats.py "results/*.jsonl" --boot 2000 --perms 5000 --kappa labeling/kappa.json --json results/summary.json` · `python harness_summary.py "results/harness_*.jsonl"` (failure taxonomy) |
 | any | `python run_grid.py --provider <p> --list-models` (what your key sees today) · `--dry-run` (plan + call budget) |
 

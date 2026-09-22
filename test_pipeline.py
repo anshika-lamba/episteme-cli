@@ -34,6 +34,14 @@ from judge import parse_judge_json, render_prompt
     ('{"command": "cat a", "relevance": "0.5"}', "cat a", 0.5),                       # numeric string accepted
     ('{"command": "ls", "relevance": 1, "reasoning": {"nested": "{brace}"}}', "ls", 1.0),
     ('prefix {"command": "echo {}", "relevance": 0.1} trailing {not json}', "echo {}", 0.1),  # last span invalid -> fall back
+    ('{"command": "ls", "relevance": 0.5} {}', "ls", 0.5),                            # trailing empty object is not an answer
+    ('```json\n{"command": "df -h", "relevance": 0.0, "reasoning": "disk",}\n```', "df -h", 0.0),  # fence + trailing comma
+    ("{'command': 'ls', 'relevance': 0.4, 'reasoning': 'ok'}", "ls", 0.4),            # single-quoted object
+    ('{\u201ccommand\u201d: \u201cls\u201d, \u201crelevance\u201d: 0.2}', "ls", 0.2),  # smart quotes
+    ('{"command": "ls", "relevance": 0.3', "ls", 0.3),                                 # one missing closer
+    ('example {"command": "ls", "relevance": 0.9} final {"command": "df -h", "relevance": 0.0}', "df -h", 0.0),
+    ('[{"command": "ls", "relevance": 0.9}, {"command": "pwd", "relevance": 0.1}]', "pwd", 0.1),
+    ('{"command": "ls", "relevance": [0.0, 0.95, 1.0]}', "ls", 1.0),                  # array -> last in-range number
 ])
 def test_extract_valid(text, expected_cmd, expected_rel):
     p = extract_last_json(text, "neutral")
@@ -42,13 +50,14 @@ def test_extract_valid(text, expected_cmd, expected_rel):
 
 @pytest.mark.parametrize("text,msg", [
     ("no json here", "No valid JSON"),
-    ('{"command": "ls", "relevance": 0.5} {}', "command"),          # trailing empty object is the LAST object
+    ("[0.0, 0.95, 1.0]", "No valid JSON"),                          # a relevance array has no command; do not invent one
     ('{"command": "", "relevance": 0.5}', "command"),
     ('{"command": "ls"}', "missing 'relevance'"),
     ('{"command": "ls", "relevance": null}', "missing 'relevance'"),
     ('{"command": "ls", "relevance": true}', "between 0.0 and 1.0"),
     ('{"command": "ls", "relevance": -0.1}', "between 0.0 and 1.0"),
     ('{"command": "ls", "relevance": "high"}', "between 0.0 and 1.0"),
+    ('{"command": "ls", "relevance": "95%"}', "between 0.0 and 1.0"),  # do not rescale a percent into 0.0
 ])
 def test_extract_invalid(text, msg):
     with pytest.raises(ParseError, match=msg):
@@ -57,6 +66,13 @@ def test_extract_invalid(text, msg):
 
 def test_no_numeric_forces_none_even_if_model_supplies_relevance():
     assert extract_last_json('{"command": "ls", "relevance": 0.7}', "no_numeric")["relevance"] is None
+
+
+def test_array_relevance_is_flagged_and_missing_relevance_is_not_zero():
+    coerced = extract_last_json('{"command": "ls", "relevance": [0.0, "0.4"]}', "neutral")
+    assert coerced["relevance"] == 0.4 and coerced["_relevance_coerced"] == "array_last"
+    with pytest.raises(ParseError, match="missing 'relevance'"):
+        extract_last_json('{"command": "ls", "relevance": null}', "original")
 
 
 # --------------------------------------------------------------------------- #
@@ -158,6 +174,31 @@ def test_bad_model_fails_fast_not_retried(monkeypatch, tmp_path):
     assert len(p.session.calls) == 1
 
 
+def test_503_retries_eight_times_then_aborts_that_trial_only(monkeypatch, tmp_path):
+    sleeps = []
+    monkeypatch.setattr(providers.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(providers, "_sleep_backoff", lambda attempt, retry_after: 12.5)
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    p = GroqProvider("allam-2-7b", ledger_dir=str(tmp_path), transport_retries=8)
+    p.session = FakeSession([FakeResp(503, "unavailable")] * 9)
+    with pytest.raises(ProviderError, match="gave up after 9"):
+        p.generate([{"role": "user", "content": "hi"}], "neutral")
+    assert len(p.session.calls) == 9 and sleeps == [12.5] * 8
+    p.session = FakeSession([FakeResp(503, "unavailable")] * 8 + [FakeResp(200, _openai_body('{"command":"ls","relevance":0.0}'))])
+    parsed, _, _ = p.generate([{"role": "user", "content": "hi"}], "neutral")
+    assert parsed["command"] == "ls" and len(p.session.calls) == 9
+
+
+def test_backoff_is_jittered_ten_to_thirty_and_honors_retry_after():
+    samples = [providers._sleep_backoff(0, None) for _ in range(40)]
+    assert all(10.0 <= s <= 30.0 for s in samples)
+    assert len({round(s, 3) for s in samples}) > 1
+    later = [providers._sleep_backoff(3, None) for _ in range(20)]
+    assert all(s <= 180.0 for s in later) and max(later) > 30.0
+    honored = providers._sleep_backoff(5, 4.0)
+    assert 4.0 <= honored <= 6.0
+
+
 def test_daily_quota_429_is_terminal(monkeypatch, tmp_path):
     _fast(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEY", "k")
@@ -224,6 +265,18 @@ def test_plan_is_condition_balanced_at_every_prefix_and_deterministic():
     assert plan == build_plan(ALL_TASKS, ALL_CONDITIONS, ALL_VARIANTS, [0, 1])
 
 
+def test_transport_circuit_breaker_stops_after_three_and_resets():
+    from run_grid import note_trial_abort
+    n, why = note_trial_abort(0, "ProviderError: groq: gave up after 9 attempts: HTTP 503", 3)
+    assert n == 1 and why is None
+    n, why = note_trial_abort(n, "ProviderError: groq: gave up after 9 attempts: HTTP 503", 3)
+    assert n == 2 and why is None
+    n, why = note_trial_abort(n, "ProviderError: groq: gave up after 9 attempts: HTTP 503", 3)
+    assert n == 3 and "exhausted transport" in why
+    assert note_trial_abort(2, None, 3) == (0, None)
+    assert note_trial_abort(5, "ProviderError: groq: gave up after 9 attempts", 0)[1] is None
+
+
 def test_existing_trial_ids_skips_quota_aborted(tmp_path):
     f = tmp_path / "r.jsonl"
     f.write_text(json.dumps({"metadata": {"trial_id": "a", "agent_version": "m", "aborted_reason": None}}) + "\n"
@@ -231,6 +284,35 @@ def test_existing_trial_ids_skips_quota_aborted(tmp_path):
                  + json.dumps({"metadata": {"trial_id": "c", "agent_version": "m", "aborted_reason": "ProviderError: 500"}}) + "\n")
     ids, models = existing_trial_ids(str(f))
     assert ids == {"a", "c"} and models == {"m"}
+
+
+def test_resume_requeues_transport_exhaustion_and_drops_a_torn_tail(tmp_path):
+    from run_grid import compact_retryable, repair_jsonl_tail, is_retryable_abort
+    from metrics import load_trajectories
+    f = tmp_path / "r.jsonl"
+    rows = [
+        {"metadata": {"trial_id": "a", "agent_version": "m", "task_name": "log_rotation", "condition": "control",
+                      "prompt_variant": "neutral", "seed": 0, "schema_version": "2.2"}, "steps": []},
+        {"metadata": {"trial_id": "b", "agent_version": "m", "task_name": "log_rotation", "condition": "control",
+                      "prompt_variant": "neutral", "seed": 1, "schema_version": "2.2",
+                      "aborted_reason": "ProviderError: groq: gave up after 9 attempts: HTTP 503"}, "steps": []},
+        {"metadata": {"trial_id": "c", "agent_version": "m", "task_name": "log_rotation", "condition": "control",
+                      "prompt_variant": "neutral", "seed": 2, "schema_version": "2.2",
+                      "aborted_reason": "ProviderError: 500"}, "steps": []},
+    ]
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows) + '{"metadata": {"trial_id": "torn"')
+    assert repair_jsonl_tail(str(f))
+    assert "torn" not in f.read_text() and f.read_text().endswith("\n")
+    assert is_retryable_abort(rows[1]["metadata"]["aborted_reason"])
+    assert not is_retryable_abort(rows[2]["metadata"]["aborted_reason"])
+    ids, _ = existing_trial_ids(str(f))
+    assert ids == {"a", "c"}
+    assert compact_retryable(str(f)) == 1
+    assert "gave up after" not in f.read_text()
+    assert {t.metadata.trial_id for t in load_trajectories([str(f)])} == {"a", "c"}
+    # a torn tail must not make stats.py raise
+    f.write_bytes(f.read_bytes() + b'{"metadata": {"trial_id": "torn"')
+    assert {t.metadata.trial_id for t in load_trajectories([str(f)])} == {"a", "c"}
 
 
 def test_mock_pilot_end_to_end(tmp_path):
@@ -558,6 +640,16 @@ def test_taskenv_routes_touch_through_git_bash_not_powershell(monkeypatch):
     assert "touch app1.log app2.log" in argv[2]
     assert argv[2].startswith('export PATH="/usr/bin:/bin:')
     assert "shell" not in kw  # must not be shell=True (that is PowerShell/cmd)
+
+
+def test_overnight_script_defaults_to_the_preregistered_budget():
+    text = Path("run_overnight.ps1").read_text(encoding="utf-8")
+    assert "AllowOverBudget" in text and "IncludeCohere" in text and "996" in text
+    assert "allam-2-7b" in text and "ministral-8b-latest" in text and "gemma-3-12b-it" in text
+    assert "command-r7b-12-2024" in text
+    assert "--transport-retries" in text
+    # the 7 x 1000 path must be behind the override, not the default invocation
+    assert "TrialsEach" in text and "-AllowOverBudget" in text
 
 
 def test_session_fixture_initializes_shell_without_per_test_set_shell():

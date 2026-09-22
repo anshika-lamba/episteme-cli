@@ -37,6 +37,10 @@ class JsonlSink:
         ev.setdefault("ts", _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"))
         self._f.write(json.dumps(ev) + "\n")
         self._f.flush()
+        try:
+            os.fsync(self._f.fileno())
+        except OSError:
+            pass
 
     def __call__(self, ev: Dict[str, Any]) -> None:
         self.events.append(ev)

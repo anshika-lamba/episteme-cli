@@ -78,9 +78,9 @@ what the web reports as of 2026-09; **verify in each console and against the
 | Gemini safety block / empty candidate | `ProviderError` → recorded, trial continues to save | none |
 | Mistral 1 req/s | `min_interval_s = 1.1` | none |
 | Cohere 1,000/month | persistent ledger; `QuotaExceededError` stops the run; judge should not use Cohere | don't pilot Cohere separately |
-| JSON wrapped in prose/fences, numeric strings, trailing `{}` | validating extractor; PARSE_FAILED recorded, 2 in a row ends trial | check parse-failure rate per model in `inspect_trajectories.py` |
-| Midnight resets differ (Groq UTC, Gemini Pacific) | 429 with "per day" ⇒ `QuotaExceeded` ⇒ clean stop; rerun resumes | rerun after reset |
-| Run dies mid-way | append+flush per trial; condition-balanced ordering; resume skips done ids | just rerun the same command |
+| JSON wrapped in prose/fences, trailing commas, smart quotes, a trailing `{}`, a relevance array | extractor repairs formatting and keeps the last object that has a command; a missing relevance is still `PARSE_FAILED` (never imputed as 0.0); 2 in a row ends the trial | check parse-failure rate per model in `inspect_trajectories.py`; coerced arrays show up in the harness log as `relevance_coerced` |
+| Midnight resets differ (Groq UTC, Gemini Pacific) | a 429 that says per-day/month is `QuotaExceeded` and stops the run (not retried). A plain 429 or 503 is retried 8 times, jittered 10–30s, then that trial only is aborted and re-queued. Three such trials in a row stop the provider (exit 4) so the overnight script moves on | rerun after reset; `.\run_overnight.ps1` does this |
+| Run dies mid-way / reboot tears the last line | append + flush + fsync per trial; torn tail truncated; resume skips finished ids and re-queues quota / `gave up after` aborts only | rerun the same command, or `.\run_overnight.ps1` |
 | Same model in two files | `run_grid.py` warns if `--out` already holds other models | keep one file per provider/model |
 
 ## 4. Decisions
