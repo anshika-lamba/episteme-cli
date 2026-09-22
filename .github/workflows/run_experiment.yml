@@ -1,12 +1,17 @@
 name: Experiment grid
-# Manual runs of run_grid.py per provider. Free-tier daily caps mean one job rarely finishes a
-# full grid: the results artifact from a previous run can be downloaded, committed to
-# results/, and the next run resumes (run_grid.py skips trial_ids already in --out).
+# Runs run_grid.py for one provider with the repo secrets, then COMMITS results/*.jsonl back to
+# the branch it was dispatched on. Free-tier daily caps stop a run cleanly (exit 3); dispatching
+# again resumes from the committed results (run_grid.py skips trial_ids already present).
+#
+#   gh workflow run run_experiment.yml --ref <branch> -f provider=gemini -f pilot=true
+#   gh workflow run run_experiment.yml --ref <branch> -f provider=mistral -f seeds=9
+#
+# Never run Cohere from here: its 1000/month ledger (.quota/) must live on ONE machine.
 on:
   workflow_dispatch:
     inputs:
       provider:
-        description: "groq | gemini | mistral | cohere | mock"
+        description: "groq | gemini | mistral | mock   (cohere: run locally, monthly ledger)"
         required: true
         default: "mock"
       model:
@@ -26,9 +31,16 @@ on:
         required: false
         default: "full"
       extra:
-        description: "extra run_grid.py flags, e.g. --max-calls 900"
+        description: "extra run_grid.py flags, e.g. --max-calls 900 --list-models"
         required: false
         default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: grid-${{ inputs.provider }}-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   tests:
@@ -44,27 +56,56 @@ jobs:
     needs: tests
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    env:
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - run: pip install -r requirements.txt
-      - name: Run grid (resumes from any results/ already committed)
+      - name: Refuse to run Cohere from CI
+        if: ${{ inputs.provider == 'cohere' }}
+        run: echo "::error::Cohere has a 1000 calls/month cap tracked in a machine-local ledger; run it locally." && exit 1
+      - name: Run grid (resumes from results/ already committed on this branch)
+        id: grid
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
         run: |
-          set -x
           ARGS="--provider ${{ inputs.provider }} --subset ${{ inputs.subset }} --seeds ${{ inputs.seeds }}"
           if [ -n "${{ inputs.model }}" ]; then ARGS="$ARGS --model ${{ inputs.model }}"; fi
           if [ "${{ inputs.pilot }}" = "true" ]; then ARGS="$ARGS --pilot"; fi
-          python run_grid.py $ARGS ${{ inputs.extra }} || true   # exit 3 = stopped at a quota wall; still upload
-          ls -la results/
+          echo "python run_grid.py $ARGS ${{ inputs.extra }}"
+          set +e
+          python run_grid.py $ARGS ${{ inputs.extra }}
+          RC=$?
+          set -e
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          echo "run_grid.py exit code $RC (0 = done, 3 = stopped at a cap/interrupt; rerun to resume)"
+          if [ "$RC" != "0" ] && [ "$RC" != "3" ]; then exit $RC; fi
       - name: Quick stats
-        run: for f in results/*.jsonl; do echo "== $f"; python stats.py "$f" --boot 200 --no-perm || true; done
-      - name: Upload results
+        if: always()
+        run: |
+          for f in results/*.jsonl; do
+            case "$f" in results/harness_*) continue;; esac
+            echo "== $f"; python stats.py "$f" --boot 200 --no-perm || true
+          done
+          python harness_summary.py "results/harness_*.jsonl" || true
+      - name: Commit results back to the branch
+        if: always()
+        run: |
+          git config user.name "episteme-grid[bot]"
+          git config user.email "episteme-grid[bot]@users.noreply.github.com"
+          git add -f results/*.jsonl || true
+          if git diff --cached --quiet; then echo "nothing new to commit"; exit 0; fi
+          git commit -m "results: ${{ inputs.provider }} ${{ inputs.model }} pilot=${{ inputs.pilot }} seeds=${{ inputs.seeds }} (run ${{ github.run_id }}, rc=${{ steps.grid.outputs.rc }})"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin "${{ github.ref_name }}" && git push origin "HEAD:${{ github.ref_name }}" && exit 0
+            sleep 15
+          done
+          echo "::warning::could not push results; they are still in the artifact"
+      - name: Upload results artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:

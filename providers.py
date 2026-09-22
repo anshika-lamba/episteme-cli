@@ -129,42 +129,69 @@ class RateLimiter:
 
 
 class CallLedger:
-    """Persistent per-calendar-month call counter (Cohere trial keys: 1000 calls/month, all endpoints)."""
+    """Persistent call counters per provider: per calendar month AND per UTC day.
 
-    def __init__(self, name: str, monthly_cap: int, ledger_dir: str = ".quota"):
+    Why: an in-memory RPD counter resets when the process restarts while the
+    server's window does not -> persistent 429s (this bit the pilot twice). Every
+    provider seeds its RateLimiter.daily_calls from here at start-up. The monthly
+    cap is only enforced when `monthly_cap` is set (Cohere trial: 1000/month, all
+    endpoints). Files live in .quota/ (git-ignored, machine-local): run a capped
+    provider from ONE machine.
+    """
+
+    def __init__(self, name: str, monthly_cap: Optional[int] = None, ledger_dir: str = ".quota"):
         self.name = name
-        self.monthly_cap = int(monthly_cap)
+        self.monthly_cap = int(monthly_cap) if monthly_cap else None
         self.path = os.path.join(ledger_dir, f"{name}.json")
         os.makedirs(ledger_dir, exist_ok=True)
 
+    @staticmethod
+    def _utc_today() -> _dt.date:
+        return _dt.datetime.now(_dt.timezone.utc).date()
+
     @property
     def month_key(self) -> str:
-        return _dt.date.today().strftime("%Y-%m")
+        return self._utc_today().strftime("%Y-%m")
 
-    def _load(self) -> Dict[str, int]:
+    @property
+    def day_key(self) -> str:
+        return self._utc_today().isoformat()
+
+    def _load(self) -> Dict[str, Dict[str, int]]:
         if not os.path.exists(self.path):
-            return {}
+            return {"months": {}, "days": {}}
         try:
             with open(self.path) as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception:
-            return {}
+            return {"months": {}, "days": {}}
+        if "months" not in data:  # legacy flat {"YYYY-MM": n}
+            data = {"months": {k: v for k, v in data.items() if isinstance(v, int)}, "days": {}}
+        data.setdefault("months", {})
+        data.setdefault("days", {})
+        return data
 
     def used(self) -> int:
-        return int(self._load().get(self.month_key, 0))
+        return int(self._load()["months"].get(self.month_key, 0))
 
-    def remaining(self) -> int:
-        return max(0, self.monthly_cap - self.used())
+    def daily_used(self) -> int:
+        return int(self._load()["days"].get(self.day_key, 0))
+
+    def remaining(self) -> Optional[int]:
+        return None if self.monthly_cap is None else max(0, self.monthly_cap - self.used())
 
     def check(self) -> None:
-        if self.used() >= self.monthly_cap:
+        if self.monthly_cap is not None and self.used() >= self.monthly_cap:
             raise QuotaExceededError(
                 f"MONTHLY_CALL_CAP reached for {self.name}: {self.used()}/{self.monthly_cap} in {self.month_key}."
             )
 
     def record(self, n: int = 1) -> None:
         data = self._load()
-        data[self.month_key] = int(data.get(self.month_key, 0)) + n
+        data["months"][self.month_key] = int(data["months"].get(self.month_key, 0)) + n
+        data["days"][self.day_key] = int(data["days"].get(self.day_key, 0)) + n
+        # keep the file small
+        data["days"] = {k: v for k, v in sorted(data["days"].items())[-45:]}
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(data, f)
@@ -294,7 +321,10 @@ class BaseProvider:
         if not self.api_key:
             raise ProviderError(f"{self.name}: missing API key (set {self.env_key}).")
         self.limiter = RateLimiter(rpm, tpm, rpd, min_interval_s)
-        self.ledger = CallLedger(self.name, monthly_cap, ledger_dir) if monthly_cap else None
+        self.ledger = CallLedger(self.name, monthly_cap, ledger_dir)
+        self.limiter.daily_calls = self.ledger.daily_used()  # survive process restarts (see CallLedger)
+        self.event_sink: Optional[Any] = None  # callable(dict) -> None; run_grid installs a JSONL writer
+        self.context: Dict[str, Any] = {}      # trial_id / step, set by the runner for event attribution
         self.max_output_tokens = int(max_output_tokens)
         self.temperature = float(temperature)
         self.transport_retries = int(transport_retries)
@@ -311,11 +341,28 @@ class BaseProvider:
         """Return (text, input_tokens, output_tokens). Raise _TransientError/ProviderError."""
         raise NotImplementedError
 
+    # -- harness event log (taxonomy of everything that is NOT the model's decision) -- #
+    def set_context(self, **kw: Any) -> None:
+        self.context = {k: v for k, v in kw.items() if v is not None}
+
+    def _emit(self, layer: str, kind: str, **fields: Any) -> None:
+        if self.event_sink is None:
+            return
+        ev = {"ts": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"), "provider": self.name,
+              "model": self.model_name, "layer": layer, "kind": kind}
+        ev.update(self.context)
+        ev.update({k: v for k, v in fields.items() if v is not None})
+        try:
+            self.event_sink(ev)
+        except Exception:  # logging must never take the run down
+            pass
+
     # -- shared -------------------------------------------------------------- #
     def _classify_http(self, status: int, body_text: str, headers: Any) -> None:
         low = (body_text or "").lower()
         if status == 429:
             if any(h in low for h in _QUOTA_HINTS):
+                self._emit("quota", "server_quota_exhausted", http_status=429, body=body_text[:300])
                 raise QuotaExceededError(f"{self.name}: quota exhausted (HTTP 429): {body_text[:300]}")
             retry_after = None
             try:
@@ -325,16 +372,20 @@ class BaseProvider:
             if retry_after is None:
                 m = re.search(r'retrydelay"?\s*:\s*"?(\d+(?:\.\d+)?)s', low)  # Gemini puts retryDelay in the body
                 retry_after = float(m.group(1)) if m else None
+            self._emit("transport", "http_429", http_status=429, retry_after=retry_after, body=body_text[:300])
             raise _TransientError(f"HTTP 429: {body_text[:200]}", retry_after)
         if status >= 500:
+            self._emit("transport", "http_5xx", http_status=status, body=body_text[:300])
             raise _TransientError(f"HTTP {status}: {body_text[:200]}")
         if status >= 400:
+            self._emit("transport", "http_4xx_fatal", http_status=status, body=body_text[:500])
             raise ProviderError(f"{self.name}/{self.model_name}: HTTP {status}: {body_text[:500]}")
 
     def _post(self, url: str, payload: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
         try:
             resp = self.session.post(url, json=payload, headers=headers, timeout=self.timeout_s)
         except requests.RequestException as e:  # DNS, timeouts, resets
+            self._emit("transport", "network_error", error=str(e)[:300])
             raise _TransientError(f"network error: {e}")
         rl = {k.lower(): v for k, v in resp.headers.items() if k.lower().startswith("x-ratelimit")}
         if rl:
@@ -344,13 +395,28 @@ class BaseProvider:
         try:
             return resp.json()
         except ValueError:
+            self._emit("transport", "non_json_body", http_status=resp.status_code, body=resp.text[:300])
             raise _TransientError(f"non-JSON body: {resp.text[:200]}")
 
     def _raw_generate(self, history: List[Dict[str, str]], retries: Optional[int]) -> Tuple[str, int, int, int]:
         chars = sum(len(m.get("content", "")) for m in history) + 256
-        est = self.limiter.wait_if_needed(chars)
-        if self.ledger:
+        wait_before = self.limiter.total_wait_s
+        try:
+            est = self.limiter.wait_if_needed(chars)
+        except QuotaExceededError as e:
+            self._emit("quota", "client_daily_cap", detail=str(e), daily_calls=self.limiter.daily_calls)
+            raise
+        except ProviderError as e:
+            self._emit("client", "oversize_request", detail=str(e), est_tokens=estimate_tokens(chars))
+            raise
+        waited = self.limiter.total_wait_s - wait_before
+        if waited >= 5:
+            self._emit("client", "throttle_wait", wait_s=round(waited, 1), est_tokens=est)
+        try:
             self.ledger.check()
+        except QuotaExceededError as e:
+            self._emit("quota", "client_monthly_cap", detail=str(e))
+            raise
         attempts = self.transport_retries if retries is None else int(retries)
         last_err: Optional[Exception] = None
         for attempt in range(attempts + 1):
@@ -360,25 +426,32 @@ class BaseProvider:
             except _TransientError as e:
                 last_err = e
                 self.limiter.record_call(est)
-                if self.ledger:
-                    self.ledger.record()
+                self.ledger.record()
                 if attempt >= attempts:
                     break
-                time.sleep(_sleep_backoff(attempt, e.retry_after))
+                backoff = _sleep_backoff(attempt, e.retry_after)
+                self._emit("transport", "retry", attempt=attempt + 1, backoff_s=round(backoff, 1), error=str(e)[:200])
+                time.sleep(backoff)
                 continue
             latency_ms = int((time.time() - t0) * 1000)
             self.limiter.record_call(in_tok or est)
-            if self.ledger:
-                self.ledger.record()
+            self.ledger.record()
             self.total_calls += 1
             self.total_input_tokens += int(in_tok or est)
             self.total_output_tokens += int(out_tok or 0)
+            if attempt:
+                self._emit("transport", "recovered", attempts=attempt + 1)
             return text, in_tok, out_tok, latency_ms
+        self._emit("transport", "gave_up", attempts=attempts + 1, error=str(last_err)[:300])
         raise ProviderError(f"{self.name}: gave up after {attempts + 1} attempts: {last_err}")
 
     def generate(self, history: List[Dict[str, str]], variant: str, retries: Optional[int] = None) -> Tuple[Dict[str, Any], int, int]:
         text, _in_tok, out_tok, latency_ms = self._raw_generate(history, retries)
-        parsed = extract_last_json(text, variant)  # ParseError propagates to the runner
+        try:
+            parsed = extract_last_json(text, variant)  # ParseError propagates to the runner
+        except ParseError as e:
+            self._emit("model_output", "parse_failed", reason=str(e), raw=(text or "")[:300], out_tokens=int(out_tok or 0))
+            raise
         parsed["_raw_text"] = text[:2000]
         return parsed, int(out_tok or 0), latency_ms
 
@@ -392,8 +465,8 @@ class BaseProvider:
             "provider": self.name, "model": self.model_name, "calls": self.total_calls,
             "input_tokens": self.total_input_tokens, "output_tokens": self.total_output_tokens,
             "limiter_wait_s": round(self.limiter.total_wait_s, 1),
-            "monthly_used": self.ledger.used() if self.ledger else None,
-            "monthly_cap": self.ledger.monthly_cap if self.ledger else None,
+            "calls_today_utc": self.ledger.daily_used(), "monthly_used": self.ledger.used(),
+            "monthly_cap": self.ledger.monthly_cap,
         }
 
 
@@ -442,9 +515,10 @@ class MistralProvider(_OpenAICompatProvider):
 
 
 class GeminiProvider(BaseProvider):
+    """Gemini API (also serves the open-weight Gemma 3 models, which have far higher free RPD)."""
     name = "gemini"
     env_key = "GEMINI_API_KEY"
-    default_model = "gemini-2.5-flash"
+    default_model = "gemma-3-12b-it"  # decision 2026-09-22: size-matched Google family member, ~14.4K RPD
     base_url = "https://generativelanguage.googleapis.com/v1beta"
 
     def _call(self, history):
@@ -459,6 +533,7 @@ class GeminiProvider(BaseProvider):
         cands = data.get("candidates") or []
         if not cands:
             reason = (data.get("promptFeedback") or {}).get("blockReason", "no candidates")
+            self._emit("transport", "empty_response", detail=str(reason))
             raise ProviderError(f"gemini: empty response ({reason})")
         parts = (cands[0].get("content") or {}).get("parts") or []
         text = "".join(p.get("text", "") for p in parts)
@@ -512,13 +587,33 @@ class CohereProvider(BaseProvider):
 REGISTRY: Dict[str, Dict[str, Any]] = {
     "groq": dict(cls=GroqProvider, rpm=30, tpm=6000, rpd=1000, min_interval_s=0.0,
                  notes="allam-2-7b: 30 RPM / 6K TPM / 1K RPD. llama-3.1-8b-instant has ~14.4K RPD if you need volume."),
-    "gemini": dict(cls=GeminiProvider, rpm=10, tpm=250000, rpd=250, min_interval_s=0.0,
-                   notes="2.5-flash free tier ~10 RPM / 250 RPD (post Dec-2025 cuts); 2.5-flash-lite ~15-30 RPM / 1000 RPD."),
+    "gemini": dict(cls=GeminiProvider, rpm=30, tpm=15000, rpd=14400, min_interval_s=0.0,
+                   notes="gemma-3-12b-it ~30 RPM / 15K TPM / 14.4K RPD. gemini-2.5-flash is only ~10 RPM / 250 RPD on the free tier."),
     "mistral": dict(cls=MistralProvider, rpm=30, tpm=500000, rpd=100000, min_interval_s=1.1,
                     notes="Experiment tier ~1 req/s (enforced via min_interval_s), 500K TPM, 1B tokens/month."),
     "cohere": dict(cls=CohereProvider, rpm=20, tpm=100000, rpd=1000, min_interval_s=0.0, monthly_cap=1000,
                    notes="Trial key: 20 RPM and a HARD 1000 calls/month across all endpoints (tracked in .quota/)."),
 }
+
+# Per-model overrides of the provider defaults (free tier, 2026-09; verify against the console/headers).
+MODEL_LIMITS: Dict[str, Dict[str, int]] = {
+    "gemini-2.5-flash": dict(rpm=10, tpm=250000, rpd=250),
+    "gemini-2.5-flash-lite": dict(rpm=15, tpm=250000, rpd=1000),
+    "gemini-2.0-flash": dict(rpm=10, tpm=250000, rpd=250),
+    "gemma-3-12b-it": dict(rpm=30, tpm=15000, rpd=14400),
+    "gemma-3-27b-it": dict(rpm=30, tpm=15000, rpd=14400),
+    "allam-2-7b": dict(rpm=30, tpm=6000, rpd=1000),
+    "llama-3.1-8b-instant": dict(rpm=30, tpm=6000, rpd=14400),
+    "llama-3.3-70b-versatile": dict(rpm=30, tpm=12000, rpd=1000),
+}
+
+
+def effective_limits(name: str, model: Optional[str]) -> Dict[str, Any]:
+    """Registry defaults, overridden by MODEL_LIMITS when the model is known."""
+    spec = {k: v for k, v in REGISTRY[name].items() if k not in ("cls", "notes")}
+    m = model or REGISTRY[name]["cls"].default_model
+    spec.update(MODEL_LIMITS.get(m, {}))
+    return spec
 
 
 def make_provider(name: str, model: Optional[str] = None, **overrides: Any) -> BaseProvider:
@@ -528,9 +623,8 @@ def make_provider(name: str, model: Optional[str] = None, **overrides: Any) -> B
         return ScriptedMockProvider(model_name=model or "mock-model", **{k: v for k, v in overrides.items() if k in ("seed", "behavior")})
     if name not in REGISTRY:
         raise ProviderError(f"Unknown provider '{name}'. Choose from: {', '.join(REGISTRY)} or mock.")
-    spec = dict(REGISTRY[name])
-    cls = spec.pop("cls")
-    spec.pop("notes", None)
+    cls = REGISTRY[name]["cls"]
+    spec = effective_limits(name, model)
     spec.update({k: v for k, v in overrides.items() if v is not None})
     return cls(model_name=model or cls.default_model, **spec)
 

@@ -29,7 +29,8 @@ import sys
 import time
 from typing import Dict, List, Set, Tuple
 
-from providers import make_provider, list_models, ProviderError, QuotaExceededError, REGISTRY
+from providers import make_provider, list_models, ProviderError, QuotaExceededError, REGISTRY, effective_limits
+from harness_summary import JsonlSink, summarize_events
 from tasks import TASKS
 from runner import run_trial
 
@@ -109,6 +110,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--list-models", action="store_true")
     ap.add_argument("--mock-seed", type=int, default=0)
+    ap.add_argument("--harness-log", default=None, help="JSONL of harness-level events (429/5xx/parse failures/quota); default results/harness_{provider}_{model}.jsonl")
     args = ap.parse_args()
 
     if args.list_models:
@@ -145,12 +147,12 @@ def main() -> int:
     print(f"grid: {len(tasks)} tasks x {len(conditions)} conditions x {len(variants)} variants x {len(seeds)} seeds = {len(plan)} trials; "
           f"{len(plan) - len(todo)} already done, {len(todo)} to run (~{len(todo) * CALLS_PER_TRIAL_EST} calls at {CALLS_PER_TRIAL_EST}/trial)", file=sys.stderr)
     if args.provider in REGISTRY:
-        spec = REGISTRY[args.provider]
+        spec = effective_limits(args.provider, args.model)
         rpm = args.rpm or spec["rpm"]
         rpd = args.rpd or spec["rpd"]
         est_calls = len(todo) * CALLS_PER_TRIAL_EST
         print(f"limits: rpm={rpm} tpm={args.tpm or spec['tpm']} rpd={rpd} min_interval={args.min_interval or spec['min_interval_s']}s "
-              f"monthly_cap={args.monthly_cap or spec.get('monthly_cap')} | {spec['notes']}", file=sys.stderr)
+              f"monthly_cap={args.monthly_cap or spec.get('monthly_cap')} | {REGISTRY[args.provider]['notes']}", file=sys.stderr)
         print(f"budget: >= {est_calls / rpm:.0f} min at the RPM ceiling; >= {est_calls / rpd:.1f} days at the RPD cap", file=sys.stderr)
     if args.dry_run:
         for i, (task, cond, var, seed) in enumerate(todo[:12]):
@@ -170,8 +172,15 @@ def main() -> int:
     except ProviderError as e:
         print(f"[fatal] {e}", file=sys.stderr)
         return 2
+    harness_log = args.harness_log or os.path.join("results", f"harness_{args.provider}_{safe_model}.jsonl")
+    sink = JsonlSink(harness_log, run_meta={"provider": args.provider, "model": model_tag, "out": out})
+    if hasattr(provider, "event_sink"):
+        provider.event_sink = sink
     if getattr(provider, "ledger", None):
-        print(f"monthly ledger: {provider.ledger.used()}/{provider.ledger.monthly_cap} used in {provider.ledger.month_key}", file=sys.stderr)
+        led = provider.ledger
+        print(f"ledger (.quota/{args.provider}.json): {led.daily_used()} calls today (UTC) -> limiter starts at {provider.limiter.daily_calls}/{provider.limiter.rpd_limit}; "
+              f"month {led.used()}" + (f"/{led.monthly_cap}" if led.monthly_cap else ""), file=sys.stderr)
+    print(f"harness events -> {harness_log}", file=sys.stderr)
 
     t_start = time.time()
     n_done = n_aborted = 0
@@ -210,7 +219,9 @@ def main() -> int:
     summary = {"provider": args.provider, "model": model_tag, "out": out, "trials_written": n_done, "aborted": n_aborted,
                "remaining": len(todo) - n_done, "elapsed_s": round(time.time() - t_start), "stop_reason": stop_reason,
                "usage": provider.usage_summary() if hasattr(provider, "usage_summary") else None,
+               "harness_events": summarize_events(sink.events), "harness_log": harness_log,
                "finished_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
+    sink.close(summary)
     print(json.dumps(summary, indent=2), file=sys.stderr)
     try:
         total_lines = sum(1 for line in open(out) if line.strip())

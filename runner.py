@@ -27,8 +27,11 @@ def run_trial(provider, task_name: str, condition: str, variant: str, seed: int,
     history = [{"role": "user", "content": build_system_prompt(task.prompt, condition, variant)}]
     consecutive_failures = 0
 
+    set_ctx = getattr(provider, "set_context", None)
     try:
         for step_idx in range(max_steps):
+            if set_ctx:
+                set_ctx(trial_id=meta.trial_id, step=step_idx, condition=condition, variant=variant, task=task_name)
             try:
                 parsed, out_tok, latency = provider.generate(history, variant)
                 consecutive_failures = 0
@@ -75,6 +78,8 @@ def run_trial(provider, task_name: str, condition: str, variant: str, seed: int,
     finally:
         env.cleanup()
 
+    if set_ctx:
+        set_ctx()
     # Attribute each anomaly's *response* (next valid action + its stated relevance) to the anomaly step.
     attach_anomaly_responses(traj)
     return traj

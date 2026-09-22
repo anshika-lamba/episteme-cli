@@ -2,9 +2,11 @@
 
 > **Status:** v1 (2026-09-21) is preserved verbatim in §A. Amendment v2 (§B) was drafted
 > 2026-09-22 **before any pilot data was analysed** (the 18-trial Groq pilot was still being
-> re-run). v2 must be read, edited where marked `[DECIDE]`, and committed **before**
-> `stats.py` is run on `pilot_groq.jsonl`. Anything changed after that point is a
-> post-hoc deviation and gets logged in §C, not edited here.
+> re-run). On 2026-09-22 the author confirmed: the Google-family model (`gemma-3-12b-it`), the
+> Groq churn log (§B8) and the sample-size definition (n = 996 **trials**, §B5). Items still
+> marked `[DECIDE]` (H1 threshold, α, κ bar, Mistral/Cohere model ids, `--expected-steps`) must
+> be settled and committed **before** `stats.py` is run on final data. Anything changed after
+> that point is a post-hoc deviation and gets logged in §C, not edited here.
 
 ---
 
@@ -59,11 +61,13 @@ to set any threshold below.
   (no relevance field; behaviour only).
 * **Grid.** 4 tasks × 3 conditions × 3 variants = 36 cells per seed per model; `run_grid.py`
   interleaves conditions so partial runs stay balanced.
-* **Models / families.** `[DECIDE]` Target 3–4 families, one model each, size-matched where
-  the free tier allows: Groq → `allam-2-7b`; Gemini → `gemini-2.5-flash` (or `gemma-3-12b-it`
-  via the same API); Mistral → `ministral-8b-latest`; Cohere → `command-r7b-12-2024`
-  (priority subset only, see B5). The registry in `providers.py` is authoritative; see B7 for
-  churn.
+* **Models / families.** Four families, one model each, size-matched (7–12B instruct) where
+  the free tier allows: Groq → `allam-2-7b` (confirmed); Google → `gemma-3-12b-it` via the
+  Gemini API (confirmed 2026-09-22: `gemini-2.5-flash` is ~250 requests/day on the free tier,
+  which cannot execute the grid on schedule; Gemma 3 12B is ~14,400/day and is the size-matched
+  family member); Mistral → `ministral-8b-latest` `[DECIDE: confirm id with --list-models]`;
+  Cohere → `command-r7b-12-2024` `[DECIDE: confirm id]` (priority subset only, see B5). The
+  registry in `providers.py` is authoritative; see B8 for churn.
 
 ### B2. Relevance attribution (clarification of v1 §3 — made before analysis)
 The prompt defines `relevance` as the probability that **the latest** warning/error is a real
@@ -102,14 +106,22 @@ Per-model results are reported for every hypothesis; the pooled test is the conf
 No interim p-value determines whether data collection continues (B5).
 
 ### B5. Sample size and stopping rule
-Target **n = 1,000 trials** across 3–4 families (≈ 250 per family = 7 seeds × 36 cells;
-Cohere: priority subset `control`/`real_skill` × `original`/`neutral` × 4 tasks × 8 seeds =
-128 trials ≈ 900 calls under the 1,000/month cap). At mock fire rates this yields ≈ 1.3
-scorable anomaly observations per trial, ≈ 450 should-act relevance observations overall,
-≈ 110 per family (per-family CI half-width ≈ ±0.09 at a rate of 0.3).
-`[DECIDE]` whether *n* is counted in trials (as here) or in should-act observations (would need
-≈ 2,200 trials). Data collection stops when the budgeted calls/time are exhausted or the
-target is reached, whichever is first; the achieved *n* is reported per cell.
+**n counts trials** (confirmed 2026-09-22). Budget fixed at **996 trials**:
+
+| Family | Grid | Seeds | Trials |
+|---|---|---|---|
+| Groq `allam-2-7b` | full (36 cells) | 9 | 324 |
+| Mistral | full (36 cells) | 9 | 324 |
+| Google `gemma-3-12b-it` | full (36 cells) | 7 | 252 |
+| Cohere | priority subset (`control`/`real_skill` × `original`/`neutral` × 4 tasks = 16 cells) | 6 | 96 |
+
+At mock fire rates (≈ 1.3 scorable anomaly observations per trial, ⅔ of trials numeric) this
+yields ≈ 450 should-act relevance observations overall (≈ 110–150 per full-grid family), i.e.
+per-family 95 % CI half-width ≈ ±0.09 at a rate of 0.3. We will **not** extend collection to
+reach 1,000 should-act observations (≈ 2,200 trials): the free-tier caps make that infeasible
+and ≈ 450 is adequate for H1–H3. Data collection stops when the seed budget above is done or
+the caps/time run out, whichever is first; the achieved *n* is reported per cell. No interim
+result influences how many trials are run.
 
 ### B6. Judge validation (Phase 4)
 60 anomaly steps sampled stratified by kind (`sample_for_labeling.py`), labelled **blind**
@@ -137,12 +149,18 @@ three times on 2026-09-22 alone; the analysis reports whichever models actually 
 
 | Date | Provider | Model | Reason |
 |------|----------|-------|--------|
-| 2026-09-21 | Groq | `llama3-8b-8192` (v1) | initial choice |
-| 2026-09-22 | Groq | → (two intermediate models) | `[FILL IN: which models, and why each was dropped — decommissioned? 429s? JSON failures?]` |
-| 2026-09-22 | Groq | → `allam-2-7b` (final) | `[FILL IN reason]`; free-tier limits 30 RPM / 6K TPM / 1K RPD |
-| 2026-09-21 | Gemini | `gemini-1.5-flash` (v1) → `[DECIDE]` | 1.5 models retired from the free tier |
+| 2026-09-21 | Groq | `llama3-8b-8192` (v1 plan) | initial choice (legacy pipeline) |
+| 2026-09-22 | Groq | Model 1 (`[model id]`) → dropped | Failed due to undocumented provider-side API parameter restrictions, resulting in identical batch HTTP 400 errors. |
+| 2026-09-22 | Groq | Model 2 (`[model id]`) → dropped | Triggered a client-side in-memory rate-limit counter mismatch: the counter reset across process restarts while the server's window did not, resulting in persistent HTTP 429s. This was a **harness artifact, not a model property**; the class of bug is closed as of 2026-09-22 (`providers.CallLedger` persists per-day call counts across restarts, and server-side per-day 429s now stop the run cleanly). |
+| 2026-09-22 | Groq | **`allam-2-7b`** (final) | Locked in because it successfully bypassed these specific harness artifacts while supporting the required context window. Free-tier limits 30 RPM / 6K TPM / 1K RPD. |
+| 2026-09-21 | Google | `gemini-1.5-flash` (v1 plan) | 1.5 models retired from the free tier |
+| 2026-09-22 | Google | **`gemma-3-12b-it`** (via Gemini API) | `gemini-2.5-flash` free tier ≈ 250 requests/day → infeasible for 252 trials on schedule; Gemma 3 12B ≈ 14,400/day and size-matched to the other families |
 | 2026-09-22 | Mistral | `[DECIDE]` (registry default `ministral-8b-latest`) | added as 3rd family |
-| 2026-09-22 | Cohere | `[DECIDE]` (registry default `command-r7b-12-2024`) | added as 4th family; priority subset only (1,000 calls/month) |
+| 2026-09-22 | Cohere | `[DECIDE]` (registry default `command-r7b-12-2024`) | added as 4th family; priority subset only (1,000 calls/month); held in reserve until Groq/Mistral/Google grids are done |
+
+Harness-level failures during the grid (429/5xx/network/quota/parse events) are logged per run
+to `results/harness_{provider}_{model}.jsonl` and summarised by `harness_summary.py`; the
+taxonomy is reported alongside the results, not hidden.
 
 ---
 

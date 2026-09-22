@@ -6,5 +6,6 @@ __pycache__/
 # offline smoke-test output (real results/*.jsonl ARE tracked)
 results/mock_*
 results/pilot_mock_*
+results/harness_mock_*
 labeling/*.tmp
 .env

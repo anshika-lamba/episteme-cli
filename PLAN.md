@@ -49,20 +49,18 @@ what the web reports as of 2026-09; **verify in each console and against the
 |---|---|---|---|---|
 | Groq `allam-2-7b` | 9 → **324** | ~2,600 | 1,000 RPD; 6K TPM (late steps ≈ 3–5K tokens ⇒ 1–2 calls/min); **TPD unknown — check headers** | ≥ 3 calendar days |
 | Mistral `ministral-8b-latest` | 9 → **324** | ~2,600 | ~1 req/s (enforced by `min_interval 1.1`) | ≈ 1–2 h |
-| Gemini `gemini-2.5-flash` | 7 → **252** | ~2,000 | **250 RPD** | ≥ 8 days ← problem |
-| Gemini alt `gemini-2.5-flash-lite` | 7 → 252 | ~2,000 | ~1,000 RPD | ≥ 2 days |
-| Gemini alt `gemma-3-12b-it` (same API/key) | 7 → 252 | ~2,000 | reported ~30 RPM / 14.4K RPD | ≈ 1.5 h — and it is the size-matched "Google family" pick |
-| Cohere `command-r7b-12-2024` | priority subset, 6 → **96** | ~700 (+~130 if you also pilot it) | **1,000 calls/month, all endpoints** (`.quota/cohere.json` tracks it) | ≈ 40 min |
-| **Total** | | **996 trials** | | |
+| Google `gemma-3-12b-it` (**decided**; `gemini-2.5-flash` at 250 RPD rejected) | 7 → **252** | ~2,000 | 30 RPM / 15K TPM / 14.4K RPD | ≈ 1.5–3.5 h (TPM-bound late in trajectories) |
+| Cohere `command-r7b-12-2024` — **held in reserve** | priority subset, 6 → **96** | ~700 | **1,000 calls/month, all endpoints** (`.quota/cohere.json`) | ≈ 40 min, run last, from one machine |
+| **Total (decided)** | | **996 trials** | | |
 
 * Priority subset = `control`/`real_skill` × `original`/`neutral` × 4 tasks (16 cells):
   keeps H1–H3 intact for Cohere, drops placebo and no_numeric there. `--subset priority`.
 * Cohere: **do not run a separate 18-trial pilot** (≈ 130 calls of the 1,000). The first 16
   trials of the priority run are the pilot; inspect them, then let it continue.
-* What n = 1,000 trials buys (from the mock: 1.32 scorable anomaly obs/trial, ⅔ with relevance):
-  ≈ 880 relevance observations, **≈ 450 should-act** (H1 denominator), ≈ 110 per family
-  ⇒ per-family 95 % CI half-width ≈ ±0.09 at a rate of 0.3; per family×condition (~37) ≈ ±0.15.
-  If "n = 1,000" was meant as *should-act observations*, that is ≈ 2,200 trials — say which.
+* **n = 996 trials is the decided budget** (n counts trials, not observations). Expected yield
+  (mock: 1.32 scorable anomaly obs/trial, ⅔ with relevance): ≈ 880 relevance observations,
+  **≈ 450 should-act** (H1 denominator), ≈ 110–150 per full-grid family ⇒ per-family 95 % CI
+  half-width ≈ ±0.09 at a rate of 0.3; per family × condition (~40) ≈ ±0.15.
 * Fire rate matters: 3 anomalies are scheduled over steps 1–6 but mock trials finish in ~5
   steps, so only ~44 % fire. If the Groq pilot shows a fire rate < 0.6, decide **before**
   Phase 5 whether to set `--expected-steps 5` (denser schedule; changes every schedule, so
@@ -85,16 +83,34 @@ what the web reports as of 2026-09; **verify in each console and against the
 | Run dies mid-way | append+flush per trial; condition-balanced ordering; resume skips done ids | just rerun the same command |
 | Same model in two files | `run_grid.py` warns if `--out` already holds other models | keep one file per provider/model |
 
-## 4. Decisions needed from you (`[DECIDE]` in PREREG.md)
+## 4. Decisions
 
-1. **Which Google model** counts as the family representative: `gemini-2.5-flash` (250 RPD),
-   `gemini-2.5-flash-lite`, or `gemma-3-12b-it` (size-matched to allam/ministral/r7b, high RPD).
-2. **Mistral and Cohere models** (defaults: `ministral-8b-latest`, `command-r7b-12-2024`) — run
-   `--list-models` first; both names may have moved on.
-3. **What n counts** (trials vs should-act observations) and the seed split above.
-4. **Thresholds** in PREREG B4 (H1 lower-bound 0.05, α = .05, κ ≥ 0.6) — keep or change, then commit.
-5. **`--expected-steps`** stays 6 or moves to 5 after seeing the pilot fire rate.
-6. The Groq churn reasons for PREREG B8.
+Decided 2026-09-22: Google model = `gemma-3-12b-it`; n = 996 trials (9/9/7 seeds + Cohere
+priority 6); Groq churn log written (PREREG B8 — only the two dropped model ids are blank).
+
+Still open (`[DECIDE]` in PREREG.md):
+1. **Mistral and Cohere model ids** (defaults `ministral-8b-latest`, `command-r7b-12-2024`) —
+   `python run_grid.py --provider mistral --list-models` first.
+2. **Thresholds** in PREREG B4 (H1 lower-bound 0.05, α = .05, κ ≥ 0.6) — keep or change, then commit.
+3. **`--expected-steps`** stays 6 or moves to 5 after seeing the pilot fire rate.
+
+## 4b. Where runs execute, and the two blockers
+
+* **The sandbox has no provider keys and `pilot_groq.jsonl` is not in the repo** (checked every
+  ref; the Actions artifacts from 2026-09-21 are 600–750-byte legacy stubs). Phases 3–4 start
+  the moment the pilot file is committed: `git add results/pilot_groq_allam-2-7b.jsonl && git
+  commit -m "pilot" && git push` (any filename under `results/` works; `stats.py` re-derives the
+  response relevance on load).
+* **GitHub Actions** (`.github/workflows/run_experiment.yml`) runs `run_grid.py` with the repo
+  secrets and **commits `results/*.jsonl` back to this branch** after each job, so runs are
+  resumable across days and analysable from anywhere. Dispatch:
+  `gh workflow run run_experiment.yml --ref arena/01a0c97b-episteme-cli -f provider=gemini -f pilot=true`
+  (then `-f seeds=7` for the grid). `.quota/` is ephemeral in Actions — server-side per-day
+  429s still stop the run cleanly; **run Cohere from one machine, never from Actions.**
+* **Groq collision:** the grid and the local pilot share the same key and the same 1,000 RPD
+  on `allam-2-7b`. Do not launch the Groq grid until the local pilot has finished.
+* Sequence that respects the methodology: 18-trial pilot per provider (≈ 130 calls each) →
+  `inspect_trajectories.py` → full grid. Gemma and Mistral pilots do not collide with anything.
 
 ## 5. Dead-time work
 While Groq/Gemini runs wait on daily caps: label the 60 items (≈ 45 min), write the

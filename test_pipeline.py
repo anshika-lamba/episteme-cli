@@ -354,3 +354,62 @@ def test_sampler_csv_is_blinded(tmp_path):
     assert len(rows) == 10 and all(r["next_command"] for r in rows)
     r2 = subprocess.run([sys.executable, "run_judge.py", "--provider", "mock", "--sample", str(lab / "sample.jsonl"), "--out", str(lab / "j.jsonl")], capture_output=True, text=True, env=env)
     assert r2.returncode == 0 and len((lab / "j.jsonl").read_text().splitlines()) == 10
+
+
+# --------------------------------------------------------------------------- #
+# harness event log + restart-safe daily counter (the "Model 2" artifact)
+# --------------------------------------------------------------------------- #
+def test_daily_counter_survives_process_restart(monkeypatch, tmp_path):
+    _fast(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    p1 = GroqProvider("allam-2-7b", rpd=3, ledger_dir=str(tmp_path))
+    p1.session = FakeSession([FakeResp(200, _openai_body('{"command":"ls","relevance":0.1}'))] * 2)
+    p1.generate([{"role": "user", "content": "hi"}], "neutral")
+    p1.generate([{"role": "user", "content": "hi"}], "neutral")
+    p2 = GroqProvider("allam-2-7b", rpd=3, ledger_dir=str(tmp_path))  # "restart"
+    assert p2.limiter.daily_calls == 2, "in-memory RPD counter must be seeded from the persistent ledger"
+    p2.session = FakeSession([FakeResp(200, _openai_body('{"command":"ls","relevance":0.1}'))])
+    p2.generate([{"role": "user", "content": "hi"}], "neutral")
+    with pytest.raises(QuotaExceededError, match="DAILY_REQUEST_CAP"):
+        p2.generate([{"role": "user", "content": "hi"}], "neutral")
+    assert p2.usage_summary()["calls_today_utc"] == 3
+
+
+def test_event_sink_taxonomy(monkeypatch, tmp_path):
+    from harness_summary import JsonlSink, summarize_events
+    _fast(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    p = GroqProvider("allam-2-7b", ledger_dir=str(tmp_path))
+    sink = JsonlSink(str(tmp_path / "h.jsonl"), run_meta={"provider": "groq"})
+    p.event_sink = sink
+    p.set_context(trial_id="t1", step=3)
+    p.session = FakeSession([FakeResp(429, {"error": "busy"}), FakeResp(503, "upstream"),
+                             FakeResp(200, _openai_body("not json at all"))])
+    with pytest.raises(ParseError):
+        p.generate([{"role": "user", "content": "hi"}], "neutral")
+    kinds = [e["kind"] for e in sink.events]
+    assert kinds == ["http_429", "retry", "http_5xx", "retry", "recovered", "parse_failed"]
+    assert all(e["trial_id"] == "t1" and e["step"] == 3 for e in sink.events)
+    p.session = FakeSession([FakeResp(404, {"message": "no such model"})])
+    p.set_context()
+    with pytest.raises(ProviderError):
+        p.generate([{"role": "user", "content": "hi"}], "neutral")
+    assert sink.events[-1]["kind"] == "http_4xx_fatal" and "trial_id" not in sink.events[-1]
+    s = summarize_events(sink.events)
+    assert s["by_kind"]["transport/http_429"] == 1 and s["by_http_status"]["404"] == 1
+    assert s["parse_failure_reasons"] == {"No valid JSON object found in response.": 1}
+    sink.close({"ok": True})
+    lines = [json.loads(l) for l in (tmp_path / "h.jsonl").read_text().splitlines()]
+    assert lines[0]["kind"] == "run_start" and lines[-1]["kind"] == "run_end" and len(lines) == 2 + len(sink.events)
+
+
+def test_model_limits_override_registry_defaults(monkeypatch, tmp_path):
+    from providers import effective_limits
+    assert effective_limits("gemini", None)["rpd"] == 14400            # gemma-3-12b-it default
+    assert effective_limits("gemini", "gemini-2.5-flash")["rpd"] == 250
+    assert effective_limits("gemini", "some-new-model")["rpd"] == 14400  # unknown -> provider default
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    p = make_provider("gemini", "gemini-2.5-flash", ledger_dir=str(tmp_path))
+    assert p.limiter.rpm == 10 and p.limiter.rpd_limit == 250
+    p2 = make_provider("gemini", "gemini-2.5-flash", rpd=99, ledger_dir=str(tmp_path))
+    assert p2.limiter.rpd_limit == 99                                     # explicit flag wins
