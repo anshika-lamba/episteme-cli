@@ -1,17 +1,16 @@
-import os, shutil, tempfile, subprocess, ntpath
+import os, shutil, tempfile, subprocess, ntpath, shlex
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 # Task scripts are POSIX shell (printf/touch/md5sum/tar/sed, `[ ! -f ]`, /dev/null).
 # On POSIX, shell=True is /bin/sh and everything works. On Windows, shell=True is
-# cmd.exe / PowerShell: `touch` is "not recognized", setup() raises CalledProcessError,
-# and every trial looks like a model failure. So on Windows every task script is routed
-# through a real POSIX shell, resolved automatically the first time TaskEnv is used
-# (unit tests, REPLs, run_grid — none of them have to remember to call set_shell()).
-#
-# Git for Windows does NOT put bash on PATH (only cmd\git.exe). These two layouts are
-# what the installer actually ships; both are checked explicitly, then bash next to
-# git.exe, then WSL.
+# cmd.exe: every Linux command fails, and that failure is the environment, not the model.
+# Windows trials therefore run as `wsl --exec bash -c` (list form, shell=False), never
+# cmd.exe. Git bash is not the sandbox: it is not a Linux userspace, and a WSL default
+# user often has passwordless sudo, which would persist `apt-get install` across trials.
+# Decision: sudo does not work in a trial. Commands run as the unprivileged user
+# `episteme` (created once via `wsl -u root` if missing, removed from sudo/wheel).
+# A distro name is never hardcoded; `wsl -l -v` must show a default (the line marked *).
 GIT_BASH_EXPLICIT = (
     r"C:\Program Files\Git\bin\bash.exe",
     r"C:\Program Files\Git\usr\bin\bash.exe",
@@ -21,12 +20,20 @@ _SHELL_FLAG = "-c"
 
 AUTO = "auto"
 NO_WINDOWS_SHELL_MSG = (
-    "no usable POSIX shell found for the sandbox. Windows PowerShell/cmd.exe cannot run the "
-    "task scripts (`touch`, `md5sum`, `tar`, `/dev/null` are not commands there). Git for Windows "
-    r"does not put bash on PATH; checked C:\Program Files\Git\bin\bash.exe and "
-    r"C:\Program Files\Git\usr\bin\bash.exe, plus bash.exe next to git.exe, and WSL. "
-    "Install Git for Windows or WSL, or pass --sandbox-shell <path to bash.exe>."
+    "WSL is not ready, so the sandbox will not fall through to cmd.exe. "
+    "Run `wsl -l -v` and confirm one distro is marked * (`wsl --set-default <name>` if not). "
+    "A distro name is not hardcoded. The harness then runs `wsl --exec true` once, untimed, "
+    "so cold-boot latency is not charged to the first trial."
 )
+# Unprivileged trial account. Not a distro name. Created once; trials never run as root
+# and never as the default user if that user can passwordless-sudo.
+TRIAL_USER = "episteme"
+# Function, not a PATH shim: `/usr/bin/sudo` is blocked by running as TRIAL_USER, who is
+# not in the sudo group. The function catches a bare `sudo` in the same bash -c.
+SUDO_LOCK = (
+    "sudo() { printf '%s\\n' 'episteme: sudo is disabled in the trial sandbox' >&2; return 127; }; "
+)
+_WSL_READY = False
 _SHELL_PREFIX = AUTO
 
 
@@ -131,6 +138,149 @@ def find_posix_shell() -> Optional[List[str]]:
     return None
 
 
+def decode_wsl_output(raw: bytes) -> str:
+    """`wsl -l -v` writes UTF-16 LE on Windows. Decoding that as UTF-8 hides the `*`."""
+    if not raw:
+        return ""
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff") or (len(raw) > 3 and raw[1] == 0):
+        return raw.decode("utf-16", errors="replace").replace("\x00", "")
+    return raw.decode("utf-8", errors="replace").replace("\x00", "")
+
+
+def default_distro_name(listing: str) -> Optional[str]:
+    """Name of the distro marked `*` in `wsl -l -v`. None if there is no default.
+    The name is only used to fail fast; commands never pass `-d <name>`."""
+    for line in (listing or "").splitlines():
+        s = line.strip().lstrip("\ufeff")
+        if s.startswith("*"):
+            rest = s[1:].strip()
+            return rest.split()[0] if rest else None
+    return None
+
+
+def wrap_trial_script(script: str, wsl_cwd: str) -> str:
+    """`cd` into the trial dir, disable bare sudo, then the script exactly as written.
+
+    Only the cwd path is shlex.quoted. The script is one argv element of
+    `bash -c` (list form, shell=False). Quoting the whole string would
+    double-escape nested quotes and break python_test's setup_script.
+    """
+    if not wsl_cwd or not str(wsl_cwd).startswith("/"):
+        raise RuntimeError(f"refusing to cd to a non-WSL path: {wsl_cwd!r}")
+    return f"cd {shlex.quote(wsl_cwd)} && {SUDO_LOCK}{script}"
+
+
+def wsl_exec_argv(body: str, user: Optional[str] = TRIAL_USER) -> List[str]:
+    """List-form argv. The body is not quoted again."""
+    argv = ["wsl"]
+    if user:
+        argv.extend(["-u", user])
+    argv.extend(["--exec", "bash", "-c", body])
+    return argv
+
+
+def _run_wsl(argv: List[str], timeout: Optional[int] = None, env: Optional[Dict[str, str]] = None):
+    kw = dict(capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False)
+    if timeout is not None:
+        kw["timeout"] = timeout
+    if env is not None:
+        kw["env"] = env
+    return subprocess.run(argv, **kw)
+
+
+_ENSURE_TRIAL_USER = r"""
+set -eu
+if ! id -u episteme >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash --user-group episteme
+fi
+for g in sudo wheel admin; do
+  if id -nG episteme | tr ' ' '\n' | grep -qx "$g"; then
+    gpasswd -d episteme "$g" >/dev/null 2>&1 || true
+  fi
+done
+rm -f /etc/sudoers.d/episteme
+passwd -l episteme >/dev/null 2>&1 || true
+"""
+
+
+def prepare_wsl_sandbox() -> List[str]:
+    """Fail fast unless a default distro exists, exit codes propagate, and the trial
+    user cannot sudo. Warm `wsl --exec true` once, with no timeout, before any trial.
+    Returns the argv prefix ending in `-c` (TaskEnv appends the script)."""
+    global _WSL_READY, _SHELL_PREFIX
+    if _WSL_READY and isinstance(_SHELL_PREFIX, list) and _SHELL_PREFIX[:1] == ["wsl"]:
+        return list(_SHELL_PREFIX)
+    if not (shutil.which("wsl") or shutil.which("wsl.exe")):
+        raise RuntimeError(NO_WINDOWS_SHELL_MSG + " `wsl.exe` was not found on PATH.")
+    listed = subprocess.run(["wsl", "-l", "-v"], capture_output=True, shell=False)
+    listing = decode_wsl_output(listed.stdout or b"")
+    distro = default_distro_name(listing)
+    if listed.returncode != 0 or not distro:
+        detail = decode_wsl_output(listed.stderr or b"")[:300]
+        raise RuntimeError(NO_WINDOWS_SHELL_MSG + f" wsl -l -v rc={listed.returncode} {detail!r}")
+    # Untimed: a short timeout here would kill the cold boot and then blame the model.
+    boot = _run_wsl(["wsl", "--exec", "true"])
+    if boot.returncode != 0:
+        raise RuntimeError(f"wsl --exec true failed (rc={boot.returncode}): {(boot.stderr or '')[:300]}")
+    probe = _run_wsl(["wsl", "--exec", "bash", "-c", "exit 17"])
+    if probe.returncode != 17:
+        raise RuntimeError(
+            f"wsl --exec bash -c did not propagate exit 17 (got {probe.returncode}). "
+            "Refusing to trust success_script return codes on this WSL version."
+        )
+    created = _run_wsl(["wsl", "-u", "root", "--exec", "bash", "-c", _ENSURE_TRIAL_USER])
+    if created.returncode != 0:
+        raise RuntimeError(
+            "could not create unprivileged trial user 'episteme' via `wsl -u root`. "
+            "Refusing to run as the default user: passwordless sudo would let a trial "
+            f"`sudo apt-get install` and persist that change. stderr={(created.stderr or '')[:400]}"
+        )
+    for probe_cmd in ("sudo -n true", "/usr/bin/sudo -n true"):
+        locked = _run_wsl(["wsl", "-u", TRIAL_USER, "--exec", "bash", "-c", probe_cmd])
+        if locked.returncode == 0:
+            raise RuntimeError(
+                f"{TRIAL_USER!r} can run {probe_cmd!r} without a password. "
+                "Sudo is disabled for trials; refusing to start."
+            )
+    _WSL_READY = True
+    return ["wsl", "-u", TRIAL_USER, "--exec", "bash", "-c"]
+
+
+def to_wsl_path(win_path: str) -> str:
+    """Windows path -> /mnt/... via wslpath. Do not guess the mount point."""
+    r = _run_wsl(["wsl", "--exec", "wslpath", "-u", win_path])
+    path = (r.stdout or "").strip()
+    if r.returncode != 0 or not path.startswith("/"):
+        raise RuntimeError(f"wslpath -u failed for {win_path!r}: {(r.stderr or '')[:300]}")
+    return path
+
+
+def wsl_self_check() -> int:
+    """Warm WSL, lock sudo, and run python_test's setup through the wrapper. Windows only."""
+    prefix = prepare_wsl_sandbox()
+    set_shell(prefix)
+    verify_python_test_setup()
+    print("wsl self-check OK")
+    print(f"trial user: {TRIAL_USER} (sudo disabled; distro name is not hardcoded)")
+    return 0
+
+
+def verify_python_test_setup() -> None:
+    """The setup_script has nested single and double quotes. Run it through the WSL
+    wrapper and read the file back. A quoting bug creates no file, or the wrong file."""
+    env = TaskEnv(TASKS["python_test"])
+    try:
+        env.setup()
+        out, err, code, _timed = env.run_cmd("test -s test_app.py && cat test_app.py")
+        if code != 0 or "def test_calc" not in out or "assert 1 == 2" not in out:
+            raise RuntimeError(
+                "python_test setup_script did not create test_app.py through the WSL wrapper "
+                f"(rc={code}). Nested quotes were likely escaped. stdout={out!r} stderr={err!r}"
+            )
+    finally:
+        env.cleanup()
+
+
 def set_shell(prefix) -> None:
     """list -> use this shell prefix; None -> force native shell=True; AUTO -> re-detect."""
     global _SHELL_PREFIX
@@ -143,19 +293,27 @@ def set_shell(prefix) -> None:
 
 
 def ensure_shell_for_direct_use() -> Optional[List[str]]:
-    """Resolve and cache the sandbox shell. Called from the pytest session fixture and from
-    the first TaskEnv use, so tests that never call set_shell() still run `touch` under Git
-    bash instead of PowerShell. None means native shell=True (POSIX). Raises RuntimeError
-    on Windows when no bash can be found."""
+    """Resolve and cache the sandbox shell. On Windows this is WSL, after the cold-boot
+    warmup, the exit-code probe, the sudo lock, and the python_test quote check.
+    None means native shell=True (POSIX). Raises RuntimeError if WSL is not ready."""
     global _SHELL_PREFIX
-    if _SHELL_PREFIX is AUTO or _SHELL_PREFIX == "notfound":
-        found = find_posix_shell()
-        if found is None and _is_windows():
-            _SHELL_PREFIX = "notfound"
+    if not _is_windows():
+        if _SHELL_PREFIX is AUTO:
+            _SHELL_PREFIX = None
+        if _SHELL_PREFIX == "notfound":
             raise RuntimeError(NO_WINDOWS_SHELL_MSG)
-        _SHELL_PREFIX = found
+        return None if _SHELL_PREFIX in (None, AUTO) else _SHELL_PREFIX
+    if _SHELL_PREFIX is None:
+        raise RuntimeError("native shell on Windows is cmd.exe; refusing. " + NO_WINDOWS_SHELL_MSG)
     if _SHELL_PREFIX == "notfound":
         raise RuntimeError(NO_WINDOWS_SHELL_MSG)
+    if _SHELL_PREFIX is AUTO:
+        try:
+            _SHELL_PREFIX = prepare_wsl_sandbox()
+            verify_python_test_setup()
+        except Exception as e:
+            _SHELL_PREFIX = "notfound"
+            raise RuntimeError(str(e)) from e
     return _SHELL_PREFIX
 
 

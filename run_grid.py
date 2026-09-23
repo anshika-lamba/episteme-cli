@@ -64,28 +64,21 @@ _GIT_BASH_OFF_PATH = (
 def resolve_sandbox_shell(choice: str) -> Tuple[Optional[list], Optional[str]]:
     """-> (shell_prefix | None, error_message).
 
-    On Windows, auto checks the two Git-for-Windows bash.exe paths itself (they are not
-    on PATH), then tasks.find_posix_shell() for git.exe siblings, Program Files (x86),
-    and WSL. TaskEnv uses the same finder, so tests that never call set_shell() agree
-    with this CLI.
+    On Windows, auto is WSL only. cmd.exe fails every Linux command, and Git bash is
+    not a substitute: the trial user must not have passwordless sudo. TaskEnv uses the
+    same prepare_wsl_sandbox() path, so a direct TaskEnv agrees with this CLI.
     """
     if choice == "native":
+        if os.name == "nt":
+            return None, "native shell on Windows is cmd.exe; it cannot run the task scripts. Leave --sandbox-shell at auto (WSL)."
         return None, None
-    if choice == "auto":
+    if choice in ("auto", "wsl"):
         if os.name != "nt":
             return None, None
-        for path in _GIT_BASH_OFF_PATH:
-            if os.path.isfile(path) and tasks_mod._probe_shell([path, "-c"]):
-                return [path, "-c"], None
-        shell = tasks_mod.find_posix_shell()
-        if shell:
-            return shell, None
-        return None, (
-            "no POSIX shell found. Checked "
-            + " and ".join(_GIT_BASH_OFF_PATH)
-            + ", bash.exe next to git.exe, bash/sh on PATH, and WSL. "
-            "PowerShell cannot run touch/md5sum/tar."
-        )
+        try:
+            return tasks_mod.prepare_wsl_sandbox(), None
+        except Exception as e:
+            return None, str(e)
     pref = [choice, "-c"]
     if (os.path.sep in choice or "/" in choice) and not os.path.isfile(choice):
         return None, f"--sandbox-shell {choice!r} does not exist"
@@ -293,9 +286,9 @@ def main() -> int:
     ap.add_argument("--mock-seed", type=int, default=0)
     ap.add_argument("--harness-log", default=None, help="JSONL of harness-level events (429/5xx/parse failures/quota); default results/harness_{provider}_{model}.jsonl")
     ap.add_argument("--sandbox-shell", default="auto",
-                    help="auto|native|<path to bash.exe>. On Windows, auto checks "
-                         r"C:\Program Files\Git\bin\bash.exe and C:\Program Files\Git\usr\bin\bash.exe "
-                         "(Git does not put bash on PATH; PowerShell/cmd.exe cannot run the tasks)")
+                    help="auto|wsl|native|<path to bash.exe>. On Windows, auto is WSL "
+                         "(wsl -l -v must show a default distro marked *). cmd.exe is refused. "
+                         "Trials run as user episteme; sudo is disabled.")
     ap.add_argument("--no-preflight", action="store_true", help="skip the 2-second sandbox sanity checks (not recommended)")
     args = ap.parse_args()
 
@@ -348,7 +341,7 @@ def main() -> int:
         shell, err = resolve_sandbox_shell(args.sandbox_shell)
         if err:
             print(f"[preflight] FAIL: {err}", file=sys.stderr)
-            print("Fix: install Git for Windows or WSL, pass --sandbox-shell <path to bash.exe>, or run on Linux.", file=sys.stderr)
+            print("Fix: install WSL, set a default distro (`wsl -l -v` must show *), or run on Linux. Do not use cmd.exe.", file=sys.stderr)
             return 1
         if shell:
             print(f"[preflight] routing sandbox commands through: {shell[0]}", file=sys.stderr)
@@ -361,7 +354,7 @@ def main() -> int:
             print("[preflight] FAIL — refusing to start (nothing wasted):", file=sys.stderr)
             for pr in problems:
                 print(f"  - {pr}", file=sys.stderr)
-            print("Fix: install Git for Windows (bash) or use WSL:  wsl python run_grid.py ...  — or pass --sandbox-shell <path to bash.exe>. "
+            print("Fix: `wsl -l -v` must show a default distro (marked *). The harness runs trials as the unprivileged user 'episteme' so sudo cannot install packages into the distro. "
                   "Only bypass with --no-preflight if you know what you are doing.", file=sys.stderr)
             return 1
         print("[preflight] sandbox OK (shell + tools + all 4 task setups)", file=sys.stderr)

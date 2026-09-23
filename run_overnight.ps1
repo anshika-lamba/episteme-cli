@@ -8,7 +8,7 @@
 
     groq    allam-2-7b           --seeds 9     (324 trials)
     mistral ministral-8b-latest  --seeds 9     (324 trials)
-    gemini  gemma-3-12b-it       --seeds 7     (252 trials)
+    gemini  gemma-3-12b-it       --seeds 7     HELD this run (quota/deprecation; -IncludeGemini to override)
 
   7 families x 1000 trials is about 7000 trials / 56000 calls. Free tiers will
   not finish that in one night (Groq allam-2-7b is 1000 requests/day; a Cohere
@@ -36,6 +36,7 @@ param(
     [int]$TrialsEach = 0,
     [switch]$Seven,
     [switch]$IncludeCohere,
+    [switch]$IncludeGemini,
     [switch]$AllowOverBudget,
     [switch]$DryRun,
     [int]$TransportRetries = 8,

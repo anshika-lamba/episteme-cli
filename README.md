@@ -27,14 +27,17 @@ is the command + `relevance` it emits at step *k+1*; that is what every metric s
 ## Setup
 
 ```powershell
-# Windows PowerShell. The task sandbox is POSIX (`touch`, `md5sum`, `tar`); cmd.exe cannot
-# run it. Git for Windows does not put bash on PATH — auto-detection checks
-# C:\Program Files\Git\bin\bash.exe and C:\Program Files\Git\usr\bin\bash.exe (and bash next
-# to git.exe / WSL) and refuses to start if none of them actually run a command.
+# Windows PowerShell. The task sandbox is Linux (`touch`, `md5sum`, `tar`). cmd.exe cannot
+# run it, and the harness will not fall through to cmd.exe. Auto mode uses WSL:
+#   wsl -l -v          # one distro must be marked *  (no distro name is hardcoded)
+# Trials run as the unprivileged user `episteme` (created once). sudo is disabled so a
+# trial cannot `apt-get install` into the distro and contaminate the next trial.
+# Gemini is excluded from this run (quota/deprecation). Cerebras is not a provider:
+# its free tier now requires a verified payment method.
 pip install -r requirements.txt           # requests + pytest only; no vendor SDKs
-$env:GROQ_API_KEY="..."; $env:GEMINI_API_KEY="..."; $env:MISTRAL_API_KEY="..."; $env:COHERE_API_KEY="..."
-python -m pytest -q                       # offline tests, including on PowerShell once Git bash is installed
-python run_grid.py --provider mock --pilot; python stats.py results/pilot_mock_mock-model.jsonl   # smoke test, no keys
+$env:GROQ_API_KEY="..."; $env:MISTRAL_API_KEY="..."; $env:COHERE_API_KEY="..."
+python -m pytest -q
+python run_grid.py --provider mock --pilot
 ```
 or on Linux/macOS/Termux: `export GROQ_API_KEY=... GEMINI_API_KEY=... MISTRAL_API_KEY=... COHERE_API_KEY=...`
 

@@ -601,18 +601,21 @@ def test_find_posix_shell_requires_working_probe(monkeypatch):
     assert tasks.find_posix_shell() is None
 
 
-def test_active_shell_raises_guidance_on_windows_without_bash(monkeypatch):
+def test_active_shell_raises_guidance_on_windows_without_wsl(monkeypatch):
     saved = tasks._SHELL_PREFIX
+    saved_ready = tasks._WSL_READY
     try:
         monkeypatch.setattr(tasks, "_is_windows", lambda: True)
-        monkeypatch.setattr(tasks, "find_posix_shell", lambda: None)
+        monkeypatch.setattr(tasks.shutil, "which", lambda name: None)
         tasks.set_shell(tasks.AUTO)
-        with pytest.raises(RuntimeError, match=r"C:\\Program Files\\Git\\bin\\bash.exe"):
+        tasks._WSL_READY = False
+        with pytest.raises(RuntimeError, match="wsl -l -v"):
             tasks.ensure_shell_for_direct_use()
-        with pytest.raises(RuntimeError, match=r"C:\\Program Files\\Git\\usr\\bin\\bash.exe"):
+        with pytest.raises(RuntimeError, match="wsl -l -v"):
             tasks.ensure_shell_for_direct_use()  # cached failure, still informative
     finally:
         tasks._SHELL_PREFIX = saved
+        tasks._WSL_READY = saved_ready
 
 
 def test_taskenv_routes_touch_through_git_bash_not_powershell(monkeypatch):
@@ -649,6 +652,116 @@ def test_overnight_script_defaults_to_the_preregistered_budget():
     assert "--transport-retries" in text
     # the 7 x 1000 path must be behind the override, not the default invocation
     assert "TrialsEach" in text and "-AllowOverBudget" in text
+
+
+def test_wsl_listing_is_utf16_and_default_is_the_star_not_a_hardcoded_name():
+    listing = "  NAME      STATE    VERSION\n* Debian    Running  2\n  Ubuntu    Stopped  2\n"
+    raw = listing.encode("utf-16-le")
+    assert tasks.default_distro_name(tasks.decode_wsl_output(raw)) == "Debian"
+    assert tasks.default_distro_name("  NAME\n  Ubuntu  Stopped  2\n") is None
+    assert "Ubuntu" not in tasks.wsl_exec_argv("true")  # no -d <distro>
+
+
+def test_python_test_setup_survives_bash_c_without_quoting_the_script(tmp_path):
+    """The case that breaks naive escaping: nested single and double quotes.
+    This is the same string the WSL wrapper passes as one argv element to bash -c."""
+    body = tasks.wrap_trial_script(tasks.TASKS["python_test"].setup_script, str(tmp_path).replace("\\", "/"))
+    # wrap requires a leading slash; on this host tmp_path already has one
+    if not str(tmp_path).startswith("/"):
+        pytest.skip("quote check runs the script under bash; Windows coverage is the argv test")
+    r = subprocess.run(["bash", "-c", body], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    text = (tmp_path / "test_app.py").read_text(encoding="utf-8")
+    assert "def test_calc():" in text and "assert 1 == 2" in text
+    sudo = subprocess.run(["bash", "-c", tasks.wrap_trial_script("sudo apt-get install -y sl", str(tmp_path))],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert sudo.returncode == 127
+    assert "sudo is disabled" in (sudo.stderr or "")
+    # a non-UTF8 byte in the observation must not raise
+    noisy = subprocess.run(["bash", "-c", "printf '\\xff'"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+    assert noisy.returncode == 0 and "\ufffd" in noisy.stdout
+
+
+def test_prepare_refuses_passwordless_sudo(monkeypatch):
+    class R:
+        def __init__(self, rc=0, out=b"", err=b""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        if argv[:3] == ["wsl", "-l", "-v"]:
+            return R(0, "* Alpine\tRunning\t2\n".encode("utf-16-le"))
+        if argv == ["wsl", "--exec", "true"]:
+            return R(0, "", "")
+        if argv == ["wsl", "--exec", "bash", "-c", "exit 17"]:
+            return R(17)
+        if argv[:4] == ["wsl", "-u", "root", "--exec"]:
+            return R(0)
+        if argv == ["wsl", "-u", "episteme", "--exec", "bash", "-c", "sudo -n true"]:
+            return R(0)  # passwordless sudo: must refuse
+        return R(1)
+
+    monkeypatch.setattr(tasks.shutil, "which", lambda name: "wsl.exe")
+    monkeypatch.setattr(tasks.subprocess, "run", fake_run)
+    monkeypatch.setattr(tasks, "_run_wsl", lambda argv, timeout=None, env=None: fake_run(argv))
+    tasks._WSL_READY = False
+    with pytest.raises(RuntimeError, match="password"):
+        tasks.prepare_wsl_sandbox()
+    assert ["wsl", "--exec", "true"] in calls  # cold-boot warmup is issued
+    assert ["wsl", "--exec", "bash", "-c", "exit 17"] in calls
+
+
+def test_one_trial_through_a_wsl_executable(tmp_path, monkeypatch):
+    """End-to-end wrapper check without a Windows host: a fake wsl.exe execs bash -c.
+    This is not a live provider trial. It does confirm cwd, exit codes, nested quotes,
+    and that the trial is not launched under shell=True."""
+    wsl = tmp_path / "wsl"
+    wsl.write_text("""#!/bin/bash
+user=""
+if [[ "${1:-}" == "-u" ]]; then user="$2"; shift 2; fi
+if [[ "${1:-}" == "-l" ]]; then printf '  NAME STATE VERSION\\n* Alpine Running 2\\n'; exit 0; fi
+if [[ "${1:-}" == "--exec" ]]; then
+  shift
+  if [[ "$1" == "true" ]]; then exit 0; fi
+  if [[ "$1" == "wslpath" ]]; then shift; printf '%s\\n' "$2"; exit 0; fi
+  if [[ "$1" == "bash" && "${2:-}" == "-c" ]]; then
+    script="$3"
+    case "$script" in
+      "exit 17") exit 17 ;;
+      "sudo -n true"|"/usr/bin/sudo -n true") exit 1 ;;
+    esac
+    if [[ "$user" == "root" ]]; then exit 0; fi
+    exec bash -c "$script"
+  fi
+fi
+printf 'unhandled: %s\\n' "$*" >&2
+exit 99
+""")
+    wsl.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setattr(tasks, "_is_windows", lambda: True)
+    tasks._WSL_READY = False
+    saved = tasks._SHELL_PREFIX
+    try:
+        tasks.set_shell(tasks.AUTO)
+        prefix = tasks.prepare_wsl_sandbox()
+        tasks.set_shell(prefix)
+        assert prefix == ["wsl", "-u", "episteme", "--exec", "bash", "-c"]
+        assert tasks._run_wsl(["wsl", "--exec", "bash", "-c", "exit 17"]).returncode == 17
+        tasks.verify_python_test_setup()
+        from mock_provider import ScriptedMockProvider
+        from runner import run_trial
+        traj = run_trial(ScriptedMockProvider(seed=1), "log_rotation", "control", "neutral", 1)
+        assert traj.metadata.aborted_reason is None
+        assert traj.steps and traj.steps[0].action == "ls"
+        assert all(s.action != "PARSE_FAILED" for s in traj.steps)
+    finally:
+        tasks._SHELL_PREFIX = saved
+        tasks._WSL_READY = False
 
 
 def test_session_fixture_initializes_shell_without_per_test_set_shell():
