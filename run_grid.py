@@ -341,7 +341,10 @@ def main() -> int:
         shell, err = resolve_sandbox_shell(args.sandbox_shell)
         if err:
             print(f"[preflight] FAIL: {err}", file=sys.stderr)
-            print("Fix: install WSL, set a default distro (`wsl -l -v` must show *), or run on Linux. Do not use cmd.exe.", file=sys.stderr)
+            if "EPISTEME_RAN" in err or "exit 17" in err:
+                print("The distro booted. The lines above are the probe's own stdout/stderr. Do not fall back to cmd.exe.", file=sys.stderr)
+            else:
+                print("Fix: install WSL, set a default distro (`wsl -l -v` must show *), or run on Linux. Do not use cmd.exe.", file=sys.stderr)
             return 1
         if shell:
             print(f"[preflight] routing sandbox commands through: {shell[0]}", file=sys.stderr)

@@ -1,4 +1,4 @@
-import os, shutil, tempfile, subprocess, ntpath, shlex
+import os, shutil, sys, tempfile, subprocess, ntpath, shlex
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
@@ -35,6 +35,7 @@ SUDO_LOCK = (
 )
 _WSL_READY = False
 _SHELL_PREFIX = AUTO
+_WSL_EXIT_EXACT = True
 
 
 def _is_windows() -> bool:
@@ -158,16 +159,33 @@ def default_distro_name(listing: str) -> Optional[str]:
     return None
 
 
+def record_exit_prefix(rc_file: str) -> str:
+    """Bash prefix that writes the Linux $? even if the script calls `exit`.
+
+    Used only when wsl.exe collapses a nonzero code (the laptop returned 1 for
+    `exit 17`). The path is assigned first so a space in the username does not
+    have to be quoted inside the trap string.
+    """
+    quoted = shlex.quote(rc_file)
+    return (
+        f"__rcfile={quoted}; trap '__rc=$?; printf \"%s\\n\" \"$__rc\" > \"$__rcfile\"' EXIT; "
+    )
+
+
 def wrap_trial_script(script: str, wsl_cwd: str) -> str:
     """`cd` into the trial dir, disable bare sudo, then the script exactly as written.
 
     Only the cwd path is shlex.quoted. The script is one argv element of
     `bash -c` (list form, shell=False). Quoting the whole string would
     double-escape nested quotes and break python_test's setup_script.
+    HOME is set to that same path: the Windows env value is not a Linux home,
+    and the trial directory path may contain spaces (wsl.exe's inherited cwd
+    has failed on those).
     """
     if not wsl_cwd or not str(wsl_cwd).startswith("/"):
         raise RuntimeError(f"refusing to cd to a non-WSL path: {wsl_cwd!r}")
-    return f"cd {shlex.quote(wsl_cwd)} && {SUDO_LOCK}{script}"
+    quoted = shlex.quote(wsl_cwd)
+    return f"cd {quoted} && export HOME={quoted} && {SUDO_LOCK}{script}"
 
 
 def wsl_exec_argv(body: str, user: Optional[str] = TRIAL_USER) -> List[str]:
@@ -179,19 +197,126 @@ def wsl_exec_argv(body: str, user: Optional[str] = TRIAL_USER) -> List[str]:
     return argv
 
 
+class _WslResult:
+    def __init__(self, returncode: int, stdout: str, stderr: str):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 def _run_wsl(argv: List[str], timeout: Optional[int] = None, env: Optional[Dict[str, str]] = None):
-    kw = dict(capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False)
+    """Bytes in, decoded text out. `wsl.exe` errors are sometimes UTF-16, like `wsl -l -v`."""
+    kw = dict(capture_output=True, shell=False)
     if timeout is not None:
         kw["timeout"] = timeout
     if env is not None:
         kw["env"] = env
-    return subprocess.run(argv, **kw)
+    r = subprocess.run(argv, **kw)
+    return _WslResult(r.returncode, decode_wsl_output(r.stdout or b""), decode_wsl_output(r.stderr or b""))
+
+
+def _exec_prefixes() -> List[List[str]]:
+    """Argv prefixes ending in `-c`. No `-d` and no distro name.
+
+    `--exec` / `-e` skip the default shell. Some builds treat a following `-c`
+    as their own flag unless `--` stops parsing, and some distros have `/bin/sh`
+    but not `bash`. The probe measures which form actually runs.
+    """
+    shells = ("bash", "/bin/bash", "sh", "/bin/sh")
+    prefixes: List[List[str]] = []
+    for sh in shells:
+        prefixes.append(["wsl", "--exec", sh, "-c"])
+        prefixes.append(["wsl", "-e", sh, "-c"])
+        prefixes.append(["wsl", "--exec", "--", sh, "-c"])
+    for sh in shells:
+        prefixes.append(["wsl", "--", sh, "-c"])
+        prefixes.append(["wsl", sh, "-c"])
+    return prefixes
+
+
+def _snippet(text: str, n: int = 220) -> str:
+    return (text or "").replace("\r", " ").replace("\n", " ")[:n]
+
+
+def _with_user(prefix: List[str], user: str) -> List[str]:
+    return [prefix[0], "-u", user] + list(prefix[1:])
+
+
+def select_wsl_exec_prefix() -> tuple:
+    """-> (argv prefix ending in `-c`, exact_exit).
+
+    exact_exit means `exit 17` came back as 17, so wsl.exe's code is the Linux
+    code. Otherwise the script ran, `exit 0` stayed 0, and a nonzero code
+    collapsed (this build returned 1 for 17). success_script only needs zero vs
+    nonzero; the harness still records the Linux $? itself. A form that turns
+    `exit 17` into 0 is not used.
+    """
+    attempts = []
+
+    def ran(result, marker: str) -> bool:
+        return marker in ((result.stdout or "") + "\n" + (result.stderr or ""))
+
+    def consider(prefix: List[str], kind_exec: bool, found: dict) -> None:
+        argv = prefix + ["echo EPISTEME_RAN; exit 17"]
+        result = _run_wsl(argv)
+        attempts.append((argv, result))
+        if not ran(result, "EPISTEME_RAN"):
+            return
+        if result.returncode == 17:
+            found.setdefault("exact_exec" if kind_exec else "exact_any", list(prefix))
+            return
+        if result.returncode == 0:
+            return
+        slot = "collapsed_exec" if kind_exec else "collapsed_any"
+        if slot in found:
+            return
+        zero_argv = prefix + ["echo EPISTEME_ZERO; exit 0"]
+        zero = _run_wsl(zero_argv)
+        attempts.append((zero_argv, zero))
+        if zero.returncode == 0 and ran(zero, "EPISTEME_ZERO"):
+            found[slot] = list(prefix)
+
+    bare = ["wsl", "--exec", "bash", "-c", "exit 17"]
+    bare_result = _run_wsl(bare)
+    attempts.append((bare, bare_result))
+    if bare_result.returncode == 17:
+        return ["wsl", "--exec", "bash", "-c"], True
+
+    found: Dict[str, List[str]] = {}
+    for prefix in _exec_prefixes():
+        consider(prefix, "--exec" in prefix or "-e" in prefix, found)
+        if "exact_exec" in found:
+            return found["exact_exec"], True
+    if "exact_any" in found:
+        return found["exact_any"], True
+    chosen = found.get("collapsed_exec") or found.get("collapsed_any")
+    if chosen:
+        return chosen, False
+
+    lines = []
+    for argv, result in attempts:
+        lines.append(
+            f"  rc={result.returncode} argv={argv!r} stdout={_snippet(result.stdout, 80)!r} stderr={_snippet(result.stderr, 160)!r}"
+        )
+    raise RuntimeError(
+        "wsl did not run a deliberate exit 17 (no form printed EPISTEME_RAN, or exit 17 came back as 0). "
+        "Refusing to trust success_script. First attempts:\n" + "\n".join(lines)
+    )
 
 
 _ENSURE_TRIAL_USER = r"""
 set -eu
+shell={shell}
+if ! [ -x "$shell" ]; then shell=/bin/sh; fi
 if ! id -u episteme >/dev/null 2>&1; then
-  useradd --create-home --shell /bin/bash --user-group episteme
+  if command -v useradd >/dev/null 2>&1; then
+    useradd --create-home --shell "$shell" --user-group episteme
+  elif command -v adduser >/dev/null 2>&1; then
+    adduser --disabled-password --gecos "" --shell "$shell" episteme 2>/dev/null || adduser -D -s "$shell" episteme
+  else
+    echo "no useradd or adduser" >&2
+    exit 1
+  fi
 fi
 for g in sudo wheel admin; do
   if id -nG episteme | tr ' ' '\n' | grep -qx "$g"; then
@@ -203,11 +328,21 @@ passwd -l episteme >/dev/null 2>&1 || true
 """
 
 
+def _login_shell(prefix: List[str]) -> str:
+    """Shell token in an argv prefix that ends with `-c`."""
+    if prefix and prefix[-1] == "-c" and len(prefix) >= 2:
+        sh = prefix[-2]
+        if sh in ("sh", "/bin/sh"):
+            return "/bin/sh"
+    return "/bin/bash"
+
+
 def prepare_wsl_sandbox() -> List[str]:
-    """Fail fast unless a default distro exists, exit codes propagate, and the trial
-    user cannot sudo. Warm `wsl --exec true` once, with no timeout, before any trial.
-    Returns the argv prefix ending in `-c` (TaskEnv appends the script)."""
-    global _WSL_READY, _SHELL_PREFIX
+    """Fail fast unless a default distro exists, a deliberate exit code is observable,
+    and the trial user cannot sudo. Warm `wsl --exec true` once, with no timeout,
+    before any trial. Returns the argv prefix ending in `-c` (TaskEnv appends the script).
+    """
+    global _WSL_READY, _SHELL_PREFIX, _WSL_EXIT_EXACT
     if _WSL_READY and isinstance(_SHELL_PREFIX, list) and _SHELL_PREFIX[:1] == ["wsl"]:
         return list(_SHELL_PREFIX)
     if not (shutil.which("wsl") or shutil.which("wsl.exe")):
@@ -222,13 +357,17 @@ def prepare_wsl_sandbox() -> List[str]:
     boot = _run_wsl(["wsl", "--exec", "true"])
     if boot.returncode != 0:
         raise RuntimeError(f"wsl --exec true failed (rc={boot.returncode}): {(boot.stderr or '')[:300]}")
-    probe = _run_wsl(["wsl", "--exec", "bash", "-c", "exit 17"])
-    if probe.returncode != 17:
-        raise RuntimeError(
-            f"wsl --exec bash -c did not propagate exit 17 (got {probe.returncode}). "
-            "Refusing to trust success_script return codes on this WSL version."
+    prefix, exact = select_wsl_exec_prefix()
+    _WSL_EXIT_EXACT = exact
+    if not exact:
+        print(
+            "[sandbox] wsl.exe did not return 17 for `exit 17`, but the script ran and `exit 0` stayed 0. "
+            "success checks use zero vs nonzero; the Linux $? is recorded in the trial directory. "
+            f"exec={' '.join(prefix)}",
+            file=sys.stderr,
         )
-    created = _run_wsl(["wsl", "-u", "root", "--exec", "bash", "-c", _ENSURE_TRIAL_USER])
+    ensure = _ENSURE_TRIAL_USER.format(shell=_login_shell(prefix))
+    created = _run_wsl(_with_user(prefix, "root") + [ensure])
     if created.returncode != 0:
         raise RuntimeError(
             "could not create unprivileged trial user 'episteme' via `wsl -u root`. "
@@ -236,23 +375,37 @@ def prepare_wsl_sandbox() -> List[str]:
             f"`sudo apt-get install` and persist that change. stderr={(created.stderr or '')[:400]}"
         )
     for probe_cmd in ("sudo -n true", "/usr/bin/sudo -n true"):
-        locked = _run_wsl(["wsl", "-u", TRIAL_USER, "--exec", "bash", "-c", probe_cmd])
+        locked = _run_wsl(_with_user(prefix, TRIAL_USER) + [probe_cmd])
         if locked.returncode == 0:
             raise RuntimeError(
                 f"{TRIAL_USER!r} can run {probe_cmd!r} without a password. "
                 "Sudo is disabled for trials; refusing to start."
             )
     _WSL_READY = True
-    return ["wsl", "-u", TRIAL_USER, "--exec", "bash", "-c"]
+    return _with_user(prefix, TRIAL_USER)
 
 
 def to_wsl_path(win_path: str) -> str:
-    """Windows path -> /mnt/... via wslpath. Do not guess the mount point."""
-    r = _run_wsl(["wsl", "--exec", "wslpath", "-u", win_path])
-    path = (r.stdout or "").strip()
-    if r.returncode != 0 or not path.startswith("/"):
-        raise RuntimeError(f"wslpath -u failed for {win_path!r}: {(r.stderr or '')[:300]}")
-    return path
+    """Windows path -> /mnt/... via wslpath. Do not guess the mount point.
+
+    Forward slashes avoid list2cmdline doubling backslashes inside quotes, which
+    breaks paths that contain a space (`C:\\Users\\Aadit Lamba\\...`).
+    """
+    if str(win_path).startswith("/"):
+        return win_path
+    forwarded = win_path.replace("\\", "/")
+    last = None
+    for argv in (
+        ["wsl", "--exec", "wslpath", "-u", forwarded],
+        ["wsl", "--", "wslpath", "-u", forwarded],
+        ["wsl", "wslpath", "-u", forwarded],
+    ):
+        last = _run_wsl(argv)
+        lines = [ln.strip() for ln in (last.stdout or "").splitlines() if ln.strip().startswith("/")]
+        if last.returncode == 0 and lines:
+            return lines[-1]
+    detail = "" if last is None else (last.stderr or "")[:300]
+    raise RuntimeError(f"wslpath -u failed for {win_path!r}: {detail}")
 
 
 def wsl_self_check() -> int:
@@ -412,8 +565,33 @@ class TaskEnv:
             if any(sec in k.upper() for sec in ["KEY", "TOKEN", "SECRET"]) or k.startswith("PYTEST_"):
                 del self.env[k]
 
+    def _recorded_exit(self, wsl_code: int) -> int:
+        """wsl.exe's code, or the Linux $? written beside the trial when codes collapse."""
+        if _WSL_EXIT_EXACT:
+            return wsl_code
+        path = os.path.join(self.dir, ".episteme_rc")
+        try:
+            text = open(path, encoding="utf-8").read().strip()
+            return int(text.splitlines()[0])
+        except (OSError, ValueError, IndexError):
+            return wsl_code
+
     def _spawn(self, script: str, **kw):
         shell = _active_shell()  # resolves AUTO on first use; raises on Windows with no POSIX shell
+        if shell and os.path.basename(str(shell[0])).lower() in ("wsl", "wsl.exe"):
+            kw.pop("cwd", None)  # wsl.exe mishandles a Windows cwd that contains spaces
+            wsl_cwd = to_wsl_path(self.dir)
+            body = wrap_trial_script(_posixize_script(script), wsl_cwd)
+            if not _WSL_EXIT_EXACT:
+                rc_path = os.path.join(self.dir, ".episteme_rc")
+                try:
+                    os.remove(rc_path)
+                except OSError:
+                    pass
+                # EXIT trap, not a trailer: `exit` inside the script skips a trailer,
+                # and that is when wsl.exe's collapsed 1 must not be what we record.
+                body = record_exit_prefix(wsl_cwd + "/.episteme_rc") + body
+            return subprocess.run(shell + [body], **kw)
         if shell:
             return subprocess.run(shell + [_posixize_script(script)], **kw)
         return subprocess.run(script, shell=True, **kw)
@@ -426,7 +604,7 @@ class TaskEnv:
         try:
             res = self._spawn(cmd, cwd=self.dir, env=self.env, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=timeout)
-            return scrub_secrets(res.stdout), scrub_secrets(res.stderr), res.returncode, False
+            return scrub_secrets(res.stdout), scrub_secrets(res.stderr), self._recorded_exit(res.returncode), False
         except subprocess.TimeoutExpired as e:
             out = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
             err = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
@@ -435,7 +613,7 @@ class TaskEnv:
     def check_success(self) -> bool:
         res = self._spawn(self.task.success_script, cwd=self.dir, env=self.env, capture_output=True,
                           text=True, encoding="utf-8", errors="replace")
-        return res.returncode == 0
+        return self._recorded_exit(res.returncode) == 0
 
     def cleanup(self):
         shutil.rmtree(self.dir, ignore_errors=True)

@@ -32,6 +32,8 @@ is the command + `relevance` it emits at step *k+1*; that is what every metric s
 #   wsl -l -v          # one distro must be marked *  (no distro name is hardcoded)
 # Trials run as the unprivileged user `episteme` (created once). sudo is disabled so a
 # trial cannot `apt-get install` into the distro and contaminate the next trial.
+# If `wsl --exec bash -c "exit 17"` returns 1, `python tasks.py` still accepts the
+# distro when the script actually ran and `exit 0` stays 0. It does not use cmd.exe.
 # Gemini is excluded from this run (quota/deprecation). Cerebras is not a provider:
 # its free tier now requires a verified payment method.
 pip install -r requirements.txt           # requests + pytest only; no vendor SDKs

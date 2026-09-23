@@ -769,6 +769,173 @@ exit 99
         tasks._WSL_READY = False
 
 
+def test_prepare_accepts_exit_17_collapsed_to_1_when_the_script_ran(monkeypatch, capsys):
+    """The laptop failure: wsl --exec bash -c 'exit 17' returned 1. If the script's
+    stdout shows it ran and exit 0 stays 0, success checks are still valid."""
+    class R:
+        def __init__(self, rc=1, out="", err=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
+
+    def fake(argv, **kw):
+        if argv[:3] == ["wsl", "-l", "-v"]:
+            return R(0, "* Alpine\tRunning\t2\n".encode("utf-16-le"))
+        if argv == ["wsl", "--exec", "true"]:
+            return R(0, "", "")
+        body = argv[-1] if argv else ""
+        if argv[:4] == ["wsl", "--exec", "bash", "-c"] and body == "echo EPISTEME_RAN; exit 17":
+            return R(1, "EPISTEME_RAN\n", "")
+        if argv[:4] == ["wsl", "--exec", "bash", "-c"] and body == "echo EPISTEME_ZERO; exit 0":
+            return R(0, "EPISTEME_ZERO\n", "")
+        if argv[:4] == ["wsl", "-u", "root", "--exec"]:
+            return R(0, "", "")
+        if "sudo" in str(body):
+            return R(1, "", "")
+        return R(1, "", "Invalid command line argument: -c")
+
+    monkeypatch.setattr(tasks.shutil, "which", lambda name: "wsl.exe")
+    monkeypatch.setattr(tasks.subprocess, "run", fake)
+    monkeypatch.setattr(tasks, "_run_wsl", lambda argv, timeout=None, env=None: fake(argv))
+    tasks._WSL_READY = False
+    tasks._WSL_EXIT_EXACT = True
+    try:
+        prefix = tasks.prepare_wsl_sandbox()
+    finally:
+        tasks._WSL_READY = False
+    assert prefix == ["wsl", "-u", "episteme", "--exec", "bash", "-c"]
+    assert tasks._WSL_EXIT_EXACT is False
+    assert "stayed 0" in capsys.readouterr().err
+    tasks._WSL_EXIT_EXACT = True
+
+
+def test_prepare_refuses_when_exit_17_never_runs_and_prints_stderr(monkeypatch):
+    class R:
+        def __init__(self, rc=1, out="", err=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
+
+    def fake(argv, **kw):
+        if argv[:3] == ["wsl", "-l", "-v"]:
+            return R(0, "* Alpine\tRunning\t2\n".encode("utf-16-le"))
+        if argv == ["wsl", "--exec", "true"]:
+            return R(0, "", "")
+        return R(1, "", "Invalid command line argument: -c")
+
+    monkeypatch.setattr(tasks.shutil, "which", lambda name: "wsl.exe")
+    monkeypatch.setattr(tasks.subprocess, "run", fake)
+    monkeypatch.setattr(tasks, "_run_wsl", lambda argv, timeout=None, env=None: fake(argv))
+    tasks._WSL_READY = False
+    with pytest.raises(RuntimeError, match="EPISTEME_RAN") as ei:
+        tasks.prepare_wsl_sandbox()
+    assert "Invalid command line argument: -c" in str(ei.value)
+    tasks._WSL_EXIT_EXACT = True
+
+
+def test_prepare_refuses_a_form_that_turns_exit_17_into_zero(monkeypatch):
+    class R:
+        def __init__(self, rc=0, out="", err=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
+
+    def fake(argv, **kw):
+        if argv[:3] == ["wsl", "-l", "-v"]:
+            return R(0, "* Alpine\tRunning\t2\n".encode("utf-16-le"))
+        if argv == ["wsl", "--exec", "true"]:
+            return R(0, "", "")
+        body = argv[-1] if argv else ""
+        if "EPISTEME_RAN" in str(body) or body == "exit 17":
+            return R(0, "EPISTEME_RAN\n", "")
+        return R(1, "", "")
+
+    monkeypatch.setattr(tasks.shutil, "which", lambda name: "wsl.exe")
+    monkeypatch.setattr(tasks.subprocess, "run", fake)
+    monkeypatch.setattr(tasks, "_run_wsl", lambda argv, timeout=None, env=None: fake(argv))
+    tasks._WSL_READY = False
+    with pytest.raises(RuntimeError, match="came back as 0"):
+        tasks.prepare_wsl_sandbox()
+    tasks._WSL_EXIT_EXACT = True
+
+
+def test_wsl_spawn_cds_into_a_path_with_spaces_and_does_not_pass_cwd(monkeypatch):
+    calls = []
+
+    class R:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(tasks.subprocess, "run", lambda argv, **kw: calls.append((argv, kw)) or R())
+    monkeypatch.setattr(tasks, "_active_shell", lambda: ["wsl", "-u", "episteme", "--exec", "bash", "-c"])
+    monkeypatch.setattr(tasks, "to_wsl_path", lambda p: "/mnt/c/Users/Aadit Lamba/trial")
+    tasks._WSL_EXIT_EXACT = True
+    env = TaskEnv(TASKS["log_rotation"])
+    try:
+        env.setup()
+    finally:
+        env.cleanup()
+    argv, kw = calls[0]
+    assert argv[:6] == ["wsl", "-u", "episteme", "--exec", "bash", "-c"]
+    body = argv[-1]
+    assert "cd '/mnt/c/Users/Aadit Lamba/trial'" in body
+    assert "touch app1.log app2.log" in body
+    assert "sudo() {" in body
+    assert "cwd" not in kw
+    py = tasks.wrap_trial_script(TASKS["python_test"].setup_script, "/mnt/c/trial")
+    assert TASKS["python_test"].setup_script in py
+    assert __import__("shlex").quote(TASKS["python_test"].setup_script) not in py
+
+
+def test_collapsed_spawn_writes_the_linux_status_beside_the_trial(monkeypatch):
+    calls = []
+
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(tasks, "_active_shell", lambda: ["wsl", "-u", "episteme", "--exec", "bash", "-c"])
+    monkeypatch.setattr(tasks, "to_wsl_path", lambda p: "/mnt/c/trial")
+    tasks._WSL_EXIT_EXACT = False
+    env = TaskEnv(TASKS["log_rotation"])
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        # spawn deletes a stale file first; the Linux command then writes the real $?
+        (Path(env.dir) / ".episteme_rc").write_text("17\n", encoding="utf-8")
+        return R()
+
+    monkeypatch.setattr(tasks.subprocess, "run", fake_run)
+    try:
+        out, err, code, timed = env.run_cmd("false")
+        assert code == 17 and timed is False
+        assert ".episteme_rc" in calls[0][-1] and "__rc=$?" in calls[0][-1]
+        assert calls[0][-1].startswith(tasks.record_exit_prefix("/mnt/c/trial/.episteme_rc"))
+    finally:
+        tasks._WSL_EXIT_EXACT = True
+        env.cleanup()
+
+
+def test_wslpath_uses_forward_slashes_so_a_space_in_the_username_survives(monkeypatch):
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "/mnt/c/Users/Aadit Lamba/trial\n"
+        stderr = ""
+
+    def fake(argv, timeout=None, env=None):
+        seen.append(argv)
+        return R()
+
+    monkeypatch.setattr(tasks, "_run_wsl", fake)
+    assert tasks.to_wsl_path(r"C:\Users\Aadit Lamba\trial") == "/mnt/c/Users/Aadit Lamba/trial"
+    assert seen[0][-1] == "C:/Users/Aadit Lamba/trial"
+    assert "\\" not in seen[0][-1]
+
+
 def test_session_fixture_initializes_shell_without_per_test_set_shell():
     """conftest.posix_sandbox_shell calls ensure_shell_for_direct_use before tests. After
     that, a direct TaskEnv (the test_cumulative.py pattern) must not still be on AUTO."""
@@ -777,7 +944,7 @@ def test_session_fixture_initializes_shell_without_per_test_set_shell():
         assert tasks.current_shell() is None  # native /bin/sh
     else:
         shell = tasks.current_shell()
-        assert shell and "bash" in " ".join(shell).lower() and shell[-1] == "-c"
+        assert shell and shell[-1] == "-c" and os.path.basename(shell[0]).lower().startswith("wsl")
 
 
 def test_harness_scripts_find_python_when_python3_is_absent(tmp_path):
@@ -805,3 +972,17 @@ def test_harness_scripts_find_python_when_python3_is_absent(tmp_path):
         assert "WROTE" in out, (out, err, code)
     finally:
         env.cleanup()
+
+
+def test_exit_trap_records_seventeen_when_the_script_calls_exit(tmp_path):
+    """wsl.exe may return 1. The file must still say 17, including when the path has a space."""
+    spaced = tmp_path / "Aadit Lamba"
+    spaced.mkdir()
+    rc = spaced / ".episteme_rc"
+    script = tasks.record_exit_prefix(str(rc)) + "exit 17"
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert r.returncode == 17, r.stderr
+    assert rc.read_text(encoding="utf-8").strip() == "17"
+    script0 = tasks.record_exit_prefix(str(rc)) + "true"
+    r0 = subprocess.run(["bash", "-c", script0], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert r0.returncode == 0 and rc.read_text(encoding="utf-8").strip() == "0"
