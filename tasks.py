@@ -6,11 +6,11 @@ from typing import Callable, Dict, List, Optional
 # On POSIX, shell=True is /bin/sh and everything works. On Windows, shell=True is
 # cmd.exe: every Linux command fails, and that failure is the environment, not the model.
 # Windows trials therefore run as `wsl --exec bash -c` (list form, shell=False), never
-# cmd.exe. Git bash is not the sandbox: it is not a Linux userspace, and a WSL default
-# user often has passwordless sudo, which would persist `apt-get install` across trials.
-# Decision: sudo does not work in a trial. Commands run as the unprivileged user
-# `episteme` (created once via `wsl -u root` if missing, removed from sudo/wheel).
-# A distro name is never hardcoded; `wsl -l -v` must show a default (the line marked *).
+# cmd.exe. Git bash is not the sandbox: it is not a Linux userspace. Trials run as the
+# default WSL user. A dedicated account is not created and `-u` is not passed: `-u` of
+# a missing user is exit 127, and creating one mutates the distro. Bare `sudo` in a
+# trial is a shell function that returns 127. A distro name is never hardcoded;
+# `wsl -l -v` must show a default (the line marked *).
 GIT_BASH_EXPLICIT = (
     r"C:\Program Files\Git\bin\bash.exe",
     r"C:\Program Files\Git\usr\bin\bash.exe",
@@ -25,13 +25,10 @@ NO_WINDOWS_SHELL_MSG = (
     "A distro name is not hardcoded. The harness then runs `wsl --exec true` once, untimed, "
     "so cold-boot latency is not charged to the first trial."
 )
-# Unprivileged trial account. Not a distro name. Created once; trials never run as root
-# and never as the default user if that user can passwordless-sudo.
-TRIAL_USER = "episteme"
-# Function, not a PATH shim: `/usr/bin/sudo` is blocked by running as TRIAL_USER, who is
-# not in the sudo group. The function catches a bare `sudo` in the same bash -c.
+# Bare `sudo` only. This does not intercept `/usr/bin/sudo`. A separate Linux account
+# is not used: `-u` of a user that does not exist exits 127 before the script runs.
 SUDO_LOCK = (
-    "sudo() { printf '%s\\n' 'episteme: sudo is disabled in the trial sandbox' >&2; return 127; }; "
+    "sudo() { printf '%s\\n' 'sudo is disabled in the trial sandbox' >&2; return 127; }; "
 )
 _WSL_READY = False
 _SHELL_PREFIX = AUTO
@@ -188,13 +185,9 @@ def wrap_trial_script(script: str, wsl_cwd: str) -> str:
     return f"cd {quoted} && export HOME={quoted} && {SUDO_LOCK}{script}"
 
 
-def wsl_exec_argv(body: str, user: Optional[str] = TRIAL_USER) -> List[str]:
-    """List-form argv. The body is not quoted again."""
-    argv = ["wsl"]
-    if user:
-        argv.extend(["-u", user])
-    argv.extend(["--exec", "bash", "-c", body])
-    return argv
+def wsl_exec_argv(body: str) -> List[str]:
+    """List-form argv. No `-u`: the default WSL user runs the body. The body is not quoted again."""
+    return ["wsl", "--exec", "bash", "-c", body]
 
 
 class _WslResult:
@@ -236,10 +229,6 @@ def _exec_prefixes() -> List[List[str]]:
 
 def _snippet(text: str, n: int = 220) -> str:
     return (text or "").replace("\r", " ").replace("\n", " ")[:n]
-
-
-def _with_user(prefix: List[str], user: str) -> List[str]:
-    return [prefix[0], "-u", user] + list(prefix[1:])
 
 
 def select_wsl_exec_prefix() -> tuple:
@@ -304,43 +293,12 @@ def select_wsl_exec_prefix() -> tuple:
     )
 
 
-_ENSURE_TRIAL_USER = r"""
-set -eu
-shell={shell}
-if ! [ -x "$shell" ]; then shell=/bin/sh; fi
-if ! id -u episteme >/dev/null 2>&1; then
-  if command -v useradd >/dev/null 2>&1; then
-    useradd --create-home --shell "$shell" --user-group episteme
-  elif command -v adduser >/dev/null 2>&1; then
-    adduser --disabled-password --gecos "" --shell "$shell" episteme 2>/dev/null || adduser -D -s "$shell" episteme
-  else
-    echo "no useradd or adduser" >&2
-    exit 1
-  fi
-fi
-for g in sudo wheel admin; do
-  if id -nG episteme | tr ' ' '\n' | grep -qx "$g"; then
-    gpasswd -d episteme "$g" >/dev/null 2>&1 || true
-  fi
-done
-rm -f /etc/sudoers.d/episteme
-passwd -l episteme >/dev/null 2>&1 || true
-"""
-
-
-def _login_shell(prefix: List[str]) -> str:
-    """Shell token in an argv prefix that ends with `-c`."""
-    if prefix and prefix[-1] == "-c" and len(prefix) >= 2:
-        sh = prefix[-2]
-        if sh in ("sh", "/bin/sh"):
-            return "/bin/sh"
-    return "/bin/bash"
-
 
 def prepare_wsl_sandbox() -> List[str]:
-    """Fail fast unless a default distro exists, a deliberate exit code is observable,
-    and the trial user cannot sudo. Warm `wsl --exec true` once, with no timeout,
-    before any trial. Returns the argv prefix ending in `-c` (TaskEnv appends the script).
+    """Fail fast unless a default distro exists and a deliberate exit code is observable.
+    Warm `wsl --exec true` once, with no timeout, before any trial. Returns the argv
+    prefix ending in `-c` (TaskEnv appends the script). No `-u`: the default WSL user
+    runs the trial. Bare `sudo` is trapped in the script, not by a separate account.
     """
     global _WSL_READY, _SHELL_PREFIX, _WSL_EXIT_EXACT
     if _WSL_READY and isinstance(_SHELL_PREFIX, list) and _SHELL_PREFIX[:1] == ["wsl"]:
@@ -366,23 +324,10 @@ def prepare_wsl_sandbox() -> List[str]:
             f"exec={' '.join(prefix)}",
             file=sys.stderr,
         )
-    ensure = _ENSURE_TRIAL_USER.format(shell=_login_shell(prefix))
-    created = _run_wsl(_with_user(prefix, "root") + [ensure])
-    if created.returncode != 0:
-        raise RuntimeError(
-            "could not create unprivileged trial user 'episteme' via `wsl -u root`. "
-            "Refusing to run as the default user: passwordless sudo would let a trial "
-            f"`sudo apt-get install` and persist that change. stderr={(created.stderr or '')[:400]}"
-        )
-    for probe_cmd in ("sudo -n true", "/usr/bin/sudo -n true"):
-        locked = _run_wsl(_with_user(prefix, TRIAL_USER) + [probe_cmd])
-        if locked.returncode == 0:
-            raise RuntimeError(
-                f"{TRIAL_USER!r} can run {probe_cmd!r} without a password. "
-                "Sudo is disabled for trials; refusing to start."
-            )
+    if "-u" in prefix:
+        raise RuntimeError("refusing to pass -u: a missing WSL user exits 127 before the script runs")
     _WSL_READY = True
-    return _with_user(prefix, TRIAL_USER)
+    return list(prefix)
 
 
 def to_wsl_path(win_path: str) -> str:
@@ -409,12 +354,12 @@ def to_wsl_path(win_path: str) -> str:
 
 
 def wsl_self_check() -> int:
-    """Warm WSL, lock sudo, and run python_test's setup through the wrapper. Windows only."""
+    """Warm WSL and run python_test's setup through the wrapper. Windows only."""
     prefix = prepare_wsl_sandbox()
     set_shell(prefix)
     verify_python_test_setup()
     print("wsl self-check OK")
-    print(f"trial user: {TRIAL_USER} (sudo disabled; distro name is not hardcoded)")
+    print("default WSL user; bare sudo is trapped in the trial script; no -u")
     return 0
 
 
@@ -447,7 +392,7 @@ def set_shell(prefix) -> None:
 
 def ensure_shell_for_direct_use() -> Optional[List[str]]:
     """Resolve and cache the sandbox shell. On Windows this is WSL, after the cold-boot
-    warmup, the exit-code probe, the sudo lock, and the python_test quote check.
+    warmup, the exit-code probe, and the python_test quote check.
     None means native shell=True (POSIX). Raises RuntimeError if WSL is not ready."""
     global _SHELL_PREFIX
     if not _is_windows():

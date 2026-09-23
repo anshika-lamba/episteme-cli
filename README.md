@@ -30,8 +30,9 @@ is the command + `relevance` it emits at step *k+1*; that is what every metric s
 # Windows PowerShell. The task sandbox is Linux (`touch`, `md5sum`, `tar`). cmd.exe cannot
 # run it, and the harness will not fall through to cmd.exe. Auto mode uses WSL:
 #   wsl -l -v          # one distro must be marked *  (no distro name is hardcoded)
-# Trials run as the unprivileged user `episteme` (created once). sudo is disabled so a
-# trial cannot `apt-get install` into the distro and contaminate the next trial.
+# Trials run as the default WSL user. Do not pass `-u episteme` and do not create that
+# account: a missing user exits 127 before the script runs. A bare `sudo` in the trial
+# script is a shell function that returns 127.
 # If `wsl --exec bash -c "exit 17"` returns 1, `python tasks.py` still accepts the
 # distro when the script actually ran and `exit 0` stays 0. It does not use cmd.exe.
 # Gemini is excluded from this run (quota/deprecation). Cerebras is not a provider:

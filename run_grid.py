@@ -65,7 +65,7 @@ def resolve_sandbox_shell(choice: str) -> Tuple[Optional[list], Optional[str]]:
     """-> (shell_prefix | None, error_message).
 
     On Windows, auto is WSL only. cmd.exe fails every Linux command, and Git bash is
-    not a substitute: the trial user must not have passwordless sudo. TaskEnv uses the
+    not a substitute. Trials run as the default WSL user; bare sudo is trapped in the script. TaskEnv uses the
     same prepare_wsl_sandbox() path, so a direct TaskEnv agrees with this CLI.
     """
     if choice == "native":
@@ -288,7 +288,7 @@ def main() -> int:
     ap.add_argument("--sandbox-shell", default="auto",
                     help="auto|wsl|native|<path to bash.exe>. On Windows, auto is WSL "
                          "(wsl -l -v must show a default distro marked *). cmd.exe is refused. "
-                         "Trials run as user episteme; sudo is disabled.")
+                         "Trials run as the default WSL user. No -u. Bare sudo is trapped in the script.")
     ap.add_argument("--no-preflight", action="store_true", help="skip the 2-second sandbox sanity checks (not recommended)")
     args = ap.parse_args()
 
@@ -357,7 +357,7 @@ def main() -> int:
             print("[preflight] FAIL — refusing to start (nothing wasted):", file=sys.stderr)
             for pr in problems:
                 print(f"  - {pr}", file=sys.stderr)
-            print("Fix: `wsl -l -v` must show a default distro (marked *). The harness runs trials as the unprivileged user 'episteme' so sudo cannot install packages into the distro. "
+            print("Fix: `wsl -l -v` must show a default distro (marked *). Trials run as the default WSL user. A bare sudo in the trial script returns 127. "
                   "Only bypass with --no-preflight if you know what you are doing.", file=sys.stderr)
             return 1
         print("[preflight] sandbox OK (shell + tools + all 4 task setups)", file=sys.stderr)

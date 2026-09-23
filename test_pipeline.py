@@ -688,7 +688,8 @@ def test_python_test_setup_survives_bash_c_without_quoting_the_script(tmp_path):
     assert noisy.returncode == 0 and "\ufffd" in noisy.stdout
 
 
-def test_prepare_refuses_passwordless_sudo(monkeypatch):
+def test_prepare_does_not_pass_user_or_create_an_account(monkeypatch):
+    """`-u episteme` exits 127 when that account does not exist. Do not create one."""
     class R:
         def __init__(self, rc=0, out=b"", err=b""):
             self.returncode = rc
@@ -704,20 +705,19 @@ def test_prepare_refuses_passwordless_sudo(monkeypatch):
             return R(0, "", "")
         if argv == ["wsl", "--exec", "bash", "-c", "exit 17"]:
             return R(17)
-        if argv[:4] == ["wsl", "-u", "root", "--exec"]:
-            return R(0)
-        if argv == ["wsl", "-u", "episteme", "--exec", "bash", "-c", "sudo -n true"]:
-            return R(0)  # passwordless sudo: must refuse
         return R(1)
 
     monkeypatch.setattr(tasks.shutil, "which", lambda name: "wsl.exe")
     monkeypatch.setattr(tasks.subprocess, "run", fake_run)
     monkeypatch.setattr(tasks, "_run_wsl", lambda argv, timeout=None, env=None: fake_run(argv))
     tasks._WSL_READY = False
-    with pytest.raises(RuntimeError, match="password"):
-        tasks.prepare_wsl_sandbox()
-    assert ["wsl", "--exec", "true"] in calls  # cold-boot warmup is issued
+    prefix = tasks.prepare_wsl_sandbox()
+    assert prefix == ["wsl", "--exec", "bash", "-c"]
+    assert tasks.wsl_exec_argv("true") == ["wsl", "--exec", "bash", "-c", "true"]
+    assert ["wsl", "--exec", "true"] in calls
     assert ["wsl", "--exec", "bash", "-c", "exit 17"] in calls
+    assert all("-u" not in argv and "episteme" not in argv and "useradd" not in " ".join(map(str, argv)) for argv in calls)
+    tasks._WSL_READY = False
 
 
 def test_one_trial_through_a_wsl_executable(tmp_path, monkeypatch):
@@ -755,7 +755,8 @@ exit 99
         tasks.set_shell(tasks.AUTO)
         prefix = tasks.prepare_wsl_sandbox()
         tasks.set_shell(prefix)
-        assert prefix == ["wsl", "-u", "episteme", "--exec", "bash", "-c"]
+        assert prefix == ["wsl", "--exec", "bash", "-c"]
+        assert "-u" not in prefix
         assert tasks._run_wsl(["wsl", "--exec", "bash", "-c", "exit 17"]).returncode == 17
         tasks.verify_python_test_setup()
         from mock_provider import ScriptedMockProvider
@@ -803,7 +804,8 @@ def test_prepare_accepts_exit_17_collapsed_to_1_when_the_script_ran(monkeypatch,
         prefix = tasks.prepare_wsl_sandbox()
     finally:
         tasks._WSL_READY = False
-    assert prefix == ["wsl", "-u", "episteme", "--exec", "bash", "-c"]
+    assert prefix == ["wsl", "--exec", "bash", "-c"]
+    assert "-u" not in prefix
     assert tasks._WSL_EXIT_EXACT is False
     assert "stayed 0" in capsys.readouterr().err
     tasks._WSL_EXIT_EXACT = True
@@ -868,7 +870,7 @@ def test_wsl_spawn_cds_into_a_path_with_spaces_and_does_not_pass_cwd(monkeypatch
         stderr = ""
 
     monkeypatch.setattr(tasks.subprocess, "run", lambda argv, **kw: calls.append((argv, kw)) or R())
-    monkeypatch.setattr(tasks, "_active_shell", lambda: ["wsl", "-u", "episteme", "--exec", "bash", "-c"])
+    monkeypatch.setattr(tasks, "_active_shell", lambda: ["wsl", "--exec", "bash", "-c"])
     monkeypatch.setattr(tasks, "to_wsl_path", lambda p: "/mnt/c/Users/Aadit Lamba/trial")
     tasks._WSL_EXIT_EXACT = True
     env = TaskEnv(TASKS["log_rotation"])
@@ -877,7 +879,8 @@ def test_wsl_spawn_cds_into_a_path_with_spaces_and_does_not_pass_cwd(monkeypatch
     finally:
         env.cleanup()
     argv, kw = calls[0]
-    assert argv[:6] == ["wsl", "-u", "episteme", "--exec", "bash", "-c"]
+    assert argv[:4] == ["wsl", "--exec", "bash", "-c"]
+    assert "-u" not in argv
     body = argv[-1]
     assert "cd '/mnt/c/Users/Aadit Lamba/trial'" in body
     assert "touch app1.log app2.log" in body
@@ -896,7 +899,7 @@ def test_collapsed_spawn_writes_the_linux_status_beside_the_trial(monkeypatch):
         stdout = ""
         stderr = ""
 
-    monkeypatch.setattr(tasks, "_active_shell", lambda: ["wsl", "-u", "episteme", "--exec", "bash", "-c"])
+    monkeypatch.setattr(tasks, "_active_shell", lambda: ["wsl", "--exec", "bash", "-c"])
     monkeypatch.setattr(tasks, "to_wsl_path", lambda p: "/mnt/c/trial")
     tasks._WSL_EXIT_EXACT = False
     env = TaskEnv(TASKS["log_rotation"])
