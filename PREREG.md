@@ -184,6 +184,7 @@ taxonomy is reported alongside the results, not hidden.
 
 ## C. Deviations log (post-ratification)
 * 2026-09-22 — Windows trials run through WSL (`wsl --exec bash -c`, list form), not cmd.exe and not Git bash. Sudo is disabled: the trial user is `episteme`, not the default user, because passwordless sudo would persist package installs across trials. Gemini is excluded from this run (quota/deprecation). Cerebras is not added: its free tier now requires a verified payment method, so older "Cerebras is free" notes are stale. JSON parsing and resume are unchanged.
+* 2026-09-23 — `.\run_overnight.ps1 -Smoke` runs one probe trial (`--max-trials 1`) for the other catalog models and writes `results/probes/`. Those files are not part of the 996 and must not be pooled into confirmatory stats. Gemini and Cohere stay excluded unless `-IncludeGemini` / `-IncludeCohere`.
 * 2026-09-22 — Agent replies are scored with strict `json.loads` only. An earlier same-day note
   allowed fence-stripping, trailing-comma repair, and taking the last object that had a command.
   That repair is withdrawn: it masks structural formatting failure and can invent a relevance

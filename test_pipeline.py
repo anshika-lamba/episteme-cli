@@ -652,6 +652,11 @@ def test_overnight_script_defaults_to_the_preregistered_budget():
     assert "--transport-retries" in text
     # the 7 x 1000 path must be behind the override, not the default invocation
     assert "TrialsEach" in text and "-AllowOverBudget" in text
+    # Gemini hold and the one-trial probe must be in the selection logic, not only the comment.
+    assert "[switch]$Smoke" in text and "--max-trials" in text and "results\\probes" in text
+    assert 'Provider -eq "gemini"' in text and "-not $IncludeGemini" in text
+    assert "groq-allam" in text and "Smoke = $false" in text
+    assert "llama-3.1-8b-instant" in text and "llama-3.3-70b-versatile" in text
 
 
 def test_wsl_listing_is_utf16_and_default_is_the_star_not_a_hardcoded_name():

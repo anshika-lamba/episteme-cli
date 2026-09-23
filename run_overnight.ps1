@@ -10,6 +10,11 @@
     mistral ministral-8b-latest  --seeds 9     (324 trials)
     gemini  gemma-3-12b-it       --seeds 7     HELD this run (quota/deprecation; -IncludeGemini to override)
 
+  -Smoke is a separate probe, not the 996. One new trial (--max-trials 1) for
+  each other catalog model, written under results\probes\ so it is not picked up
+  by `stats.py results\*.jsonl`. Gemini and Cohere stay off unless you also pass
+  -IncludeGemini / -IncludeCohere. Do not combine -Smoke with -Seven.
+
   7 families x 1000 trials is about 7000 trials / 56000 calls. Free tiers will
   not finish that in one night (Groq allam-2-7b is 1000 requests/day; a Cohere
   trial key is 1000 calls/month). That path runs only when you pass
@@ -30,11 +35,18 @@
   .\run_overnight.ps1 -DryRun
 
 .EXAMPLE
+  .\run_overnight.ps1 -Smoke
+  One trial each: llama-3.1-8b-instant, llama-3.3-70b-versatile.
+  Add -IncludeGemini for gemma-3-12b-it and gemma-3-27b-it.
+  Add -IncludeCohere for command-r7b-12-2024. That spends the held ledger.
+
+.EXAMPLE
   .\run_overnight.ps1 -Seven -TrialsEach 1000 -IncludeCohere -AllowOverBudget
 #>
 param(
     [int]$TrialsEach = 0,
     [switch]$Seven,
+    [switch]$Smoke,
     [switch]$IncludeCohere,
     [switch]$IncludeGemini,
     [switch]$AllowOverBudget,
@@ -61,20 +73,44 @@ function Write-Log([string]$Message) {
 
 # 36 cells per seed. Prereg = 0 means "not in the locked budget".
 # Cohere is the 7th family and stays off unless -IncludeCohere.
+# Gemini stays off unless -IncludeGemini (quota/deprecation this run).
+# Smoke = the other catalog models, one new trial each, not the 996.
 $Catalog = @(
-    @{ Name = "groq-allam";   Provider = "groq";    Model = "allam-2-7b";             Prereg = 9; Cohere = $false; Subset = "" },
-    @{ Name = "groq-llama8";  Provider = "groq";    Model = "llama-3.1-8b-instant";   Prereg = 0; Cohere = $false; Subset = "" },
-    @{ Name = "groq-llama70"; Provider = "groq";    Model = "llama-3.3-70b-versatile"; Prereg = 0; Cohere = $false; Subset = "" },
-    @{ Name = "mistral";      Provider = "mistral"; Model = "ministral-8b-latest";    Prereg = 9; Cohere = $false; Subset = "" },
-    @{ Name = "gemma-12b";    Provider = "gemini";  Model = "gemma-3-12b-it";         Prereg = 7; Cohere = $false; Subset = "" },
-    @{ Name = "gemma-27b";    Provider = "gemini";  Model = "gemma-3-27b-it";         Prereg = 0; Cohere = $false; Subset = "" },
-    @{ Name = "cohere";       Provider = "cohere";  Model = "command-r7b-12-2024";    Prereg = 6; Cohere = $true;  Subset = "priority" }
+    @{ Name = "groq-allam";   Provider = "groq";    Model = "allam-2-7b";              Prereg = 9; Cohere = $false; Subset = ""; Smoke = $false },
+    @{ Name = "groq-llama8";  Provider = "groq";    Model = "llama-3.1-8b-instant";    Prereg = 0; Cohere = $false; Subset = ""; Smoke = $true },
+    @{ Name = "groq-llama70"; Provider = "groq";    Model = "llama-3.3-70b-versatile"; Prereg = 0; Cohere = $false; Subset = ""; Smoke = $true },
+    @{ Name = "mistral";      Provider = "mistral"; Model = "ministral-8b-latest";     Prereg = 9; Cohere = $false; Subset = ""; Smoke = $false },
+    @{ Name = "gemma-12b";    Provider = "gemini";  Model = "gemma-3-12b-it";          Prereg = 7; Cohere = $false; Subset = ""; Smoke = $true },
+    @{ Name = "gemma-27b";    Provider = "gemini";  Model = "gemma-3-27b-it";          Prereg = 0; Cohere = $false; Subset = ""; Smoke = $true },
+    @{ Name = "cohere";       Provider = "cohere";  Model = "command-r7b-12-2024";     Prereg = 6; Cohere = $true;  Subset = "priority"; Smoke = $true }
 )
+
+if ($Smoke -and ($Seven -or $TrialsEach -gt 0 -or $AllowOverBudget)) {
+    Write-Log "REFUSING: -Smoke is one trial per other model. Do not combine it with -Seven, -TrialsEach, or -AllowOverBudget."
+    exit 2
+}
 
 $Selected = New-Object System.Collections.Generic.List[object]
 foreach ($job in $Catalog) {
+    if ($job.Provider -eq "gemini" -and -not $IncludeGemini) {
+        $wanted = $Smoke -and $job.Smoke
+        if (-not $Smoke -and ($Seven -or $job.Prereg -gt 0)) { $wanted = $true }
+        if ($wanted) {
+            Write-Log ("skip {0}: Gemini is excluded this run. Pass -IncludeGemini for one override." -f $job.Name)
+        }
+        continue
+    }
+    if ($job.Cohere -and -not $IncludeCohere) {
+        if ($Smoke -and $job.Smoke) {
+            Write-Log ("skip {0}: Cohere stays held. Pass -IncludeCohere to spend one probe trial." -f $job.Name)
+        }
+        continue
+    }
     $include = $false
-    if ($job.Cohere) {
+    $maxTrials = 0
+    if ($Smoke) {
+        $include = [bool]$job.Smoke
+    } elseif ($job.Cohere) {
         $include = [bool]$IncludeCohere
     } elseif ($Seven) {
         $include = $true
@@ -82,7 +118,11 @@ foreach ($job in $Catalog) {
         $include = $true
     }
     if (-not $include) { continue }
-    if ($TrialsEach -gt 0) {
+    if ($Smoke) {
+        $seeds = 1
+        $subset = ""
+        $maxTrials = 1
+    } elseif ($TrialsEach -gt 0) {
         $seeds = [int][Math]::Ceiling($TrialsEach / 36.0)
         $subset = ""
     } else {
@@ -93,7 +133,7 @@ foreach ($job in $Catalog) {
         Write-Log ("skip {0}: no seed count in the locked budget. Pass -TrialsEach N -AllowOverBudget to size it." -f $job.Name)
         continue
     }
-    $Selected.Add(@{ Job = $job; Seeds = $seeds; Subset = $subset })
+    $Selected.Add(@{ Job = $job; Seeds = $seeds; Subset = $subset; MaxTrials = $maxTrials })
 }
 
 if ($Selected.Count -eq 0) {
@@ -102,13 +142,17 @@ if ($Selected.Count -eq 0) {
 }
 
 $planned = 0
-foreach ($item in $Selected) { $planned += ([int]$item.Seeds * 36) }
+foreach ($item in $Selected) {
+    if ([int]$item.MaxTrials -gt 0) { $planned += [int]$item.MaxTrials }
+    else { $planned += ([int]$item.Seeds * 36) }
+}
 
 Write-Log ("plan: {0} job(s), {1} trials, one provider at a time, transport-retries={2}" -f $Selected.Count, $planned, $TransportRetries)
 foreach ($item in $Selected) {
     $job = $item.Job
     $extra = ""
     if ($item.Subset) { $extra = " --subset $($item.Subset)" }
+    if ([int]$item.MaxTrials -gt 0) { $extra += " --max-trials $($item.MaxTrials)" }
     Write-Log ("  {0,-14} {1,-28} seeds={2}{3}" -f $job.Provider, $job.Model, $item.Seeds, $extra)
 }
 
@@ -117,6 +161,9 @@ if ($planned -gt 996 -and -not $AllowOverBudget) {
     Write-Log "7 families x 1000 trials is about 7000 trials / 56000 calls and will not finish on free tiers (Groq allam-2-7b is 1000 RPD; Cohere trial keys are 1000 calls/month)."
     Write-Log "Re-run with -AllowOverBudget if you mean it. Nothing was called."
     exit 2
+}
+if ($Smoke) {
+    Write-Log "SMOKE: one new trial per other model, under results\probes\. Not part of the 996. Do not pass that folder to stats.py."
 }
 if ($IncludeCohere) {
     Write-Log "WARNING: Cohere is in this plan. A trial key is a hard 1000 calls/month across every endpoint. This spends the ledger you were holding in reserve."
@@ -158,6 +205,11 @@ foreach ($item in $Selected) {
     )
     if ($item.Subset) {
         $pyArgs += @("--subset", $item.Subset)
+    }
+    if ([int]$item.MaxTrials -gt 0) {
+        $pyArgs += @("--max-trials", "$($item.MaxTrials)")
+        $safeModel = ($job.Model -replace "[/:]", "-")
+        $pyArgs += @("--out", (Join-Path $RepoRoot ("results\probes\{0}_{1}.jsonl" -f $job.Provider, $safeModel)))
     }
     if ($DryRun) {
         $pyArgs += "--dry-run"
